@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SOF Builder
+GenericName=SOF Topology2 Visual Editor & Testbench Studio
+Comment=Visual Graph Editor, IPC4 Topology Compiler & Real-Time SOF Testbench
+Exec=sof-builder %f
+Icon=audio-card
+Terminal=false
+Categories=Development;AudioVideo;Audio;
+Keywords=SOF;ALSA;Topology2;DSP;IPC4;Testbench;
+StartupWMClass=org.thesofproject.SofBuilder

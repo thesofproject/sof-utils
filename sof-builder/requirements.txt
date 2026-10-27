@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Python runtime dependencies for SOF Builder (sof-builder).
+#
+# Note: PyGObject and pycairo require the system GObject Introspection and
+# GTK 4 development headers / typelibs to be installed on your distribution
+# (e.g. `gir1.2-gtk-4.0`, `libgirepository1.0-dev` or `libgirepository-2.0-dev`,
+# and `libcairo2-dev` on Debian/Ubuntu) when building inside a virtual environment.
+PyGObject>=3.42.0
+pycairo>=1.20.0
