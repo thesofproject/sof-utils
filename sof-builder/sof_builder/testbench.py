@@ -2046,10 +2046,13 @@ class TestbenchRunner:
         return preset_map.get(plat, "mtl")
 
     def _find_testbench_bin(self) -> str:
+        sof_utils_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         sof_root = os.path.abspath(os.path.join(self.topology2_root, "..", "..", ".."))
         workspace_root = os.path.abspath(os.path.join(sof_root, ".."))
         candidates = [
             os.environ.get("SOF_TESTBENCH_BIN", ""),
+            os.path.join(sof_utils_root, "sof-testbench", "build", "sof-testbench4"),
+            os.path.join(sof_utils_root, "build", "sof-testbench", "sof-testbench4"),
             os.path.join(sof_root, "tools", "testbench", "build_testbench", "sof-testbench4"),
             os.path.join(sof_root, "tools", "testbench", "build_testbench", "install", "bin", "sof-testbench4"),
             os.path.join(sof_root, "build_testbench", "sof-testbench4"),

@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# West manifest for sof-utils.
+# Aligns the SOF firmware repository (src/audio, src/ipc, src/math) version
+# with sof-utils (sof-testbench4, sof-tb-ctl, tplg_parser, sof-builder).
+
+manifest:
+  defaults:
+    remote: thesofproject
+
+  remotes:
+    - name: thesofproject
+      url-base: https://github.com/thesofproject
+
+  projects:
+    - name: sof
+      repo-path: sof
+      path: sof
+      revision: main
+      import:
+        file: west.yml
+        name-allowlist:
+          - zephyr
+
+  self:
+    path: sof-utils
