@@ -124,12 +124,113 @@ struct sof_cdev_probe_point {
 	char     widget_name[32];
 };
 
+struct sof_cdev_ipc_msg {
+	uint32_t primary;
+	uint32_t extension;
+	uint32_t tx_size;
+	uint32_t rx_size;
+	uint32_t reply_primary;
+	uint32_t reply_extension;
+	int32_t  ipc_status;
+	uint32_t flags;
+	uint64_t tx_data_ptr;
+	uint64_t rx_data_ptr;
+};
+
+struct sof_cdev_large_cfg {
+	uint32_t module_id;
+	uint32_t instance_id;
+	uint32_t param_id;
+	uint32_t set_get;
+	uint32_t data_size;
+	uint32_t flags;
+	uint64_t data_ptr;
+};
+
+struct sof_cdev_win_io {
+	uint32_t win_id;
+	uint32_t slot_type;
+	uint32_t slot_index;
+	uint32_t offset;
+	uint32_t size;
+	uint32_t flags;
+	uint64_t data_ptr;
+};
+
+struct sof_cdev_winstream_io {
+	uint32_t slot_type;
+	uint32_t rx_win_size;
+	uint32_t tx_len;
+	uint32_t rx_buf_len;
+	uint32_t rx_bytes_read;
+	uint32_t seq_in_out;
+	uint64_t tx_ptr;
+	uint64_t rx_ptr;
+};
+
+struct sof_cdev_llext_load {
+	uint32_t mode;
+	uint32_t lib_id;
+	uint32_t data_size;
+	int32_t  fw_state;
+	uint64_t data_ptr;
+};
+
+struct sof_cdev_probe_ctl {
+	uint32_t op;
+	uint32_t stream_tag;
+	uint32_t dma_buffer_size;
+	uint32_t num_points;
+	uint64_t points_ptr;
+};
+
+#define SOF_CDEV_EVT_FW_STATE		1
+#define SOF_CDEV_EVT_IPC_NOTIFICATION	2
+
+struct sof_cdev_event {
+	uint64_t timestamp_ns;
+	uint32_t event_type;
+	uint32_t fw_state;
+	uint32_t primary;
+	uint32_t extension;
+};
+
+#ifdef __linux__
+#include <sys/ioctl.h>
+#define SOF_CDEV_IOC_MAGIC	'S'
+#define SOF_IOC_GET_INFO	_IOR(SOF_CDEV_IOC_MAGIC, 0x01, struct sof_cdev_info)
+#define SOF_IOC_PM_CTL		_IOWR(SOF_CDEV_IOC_MAGIC, 0x02, struct sof_cdev_pm_ctl)
+#define SOF_IOC_IPC_TX		_IOWR(SOF_CDEV_IOC_MAGIC, 0x10, struct sof_cdev_ipc_msg)
+#define SOF_IOC_IPC_LARGE_CFG	_IOWR(SOF_CDEV_IOC_MAGIC, 0x11, struct sof_cdev_large_cfg)
+#define SOF_IOC_WIN_INFO	_IOR(SOF_CDEV_IOC_MAGIC, 0x20, struct sof_cdev_win_info)
+#define SOF_IOC_WIN_READ	_IOWR(SOF_CDEV_IOC_MAGIC, 0x21, struct sof_cdev_win_io)
+#define SOF_IOC_WIN_WRITE	_IOW(SOF_CDEV_IOC_MAGIC, 0x22, struct sof_cdev_win_io)
+#define SOF_IOC_WINSTREAM_IO	_IOWR(SOF_CDEV_IOC_MAGIC, 0x23, struct sof_cdev_winstream_io)
+#define SOF_IOC_LLEXT_LOAD	_IOWR(SOF_CDEV_IOC_MAGIC, 0x30, struct sof_cdev_llext_load)
+#define SOF_IOC_PROBE_CTL	_IOWR(SOF_CDEV_IOC_MAGIC, 0x40, struct sof_cdev_probe_ctl)
+#endif
+
 /*
  * Network Protocol Definitions (TCP port 9998)
  */
 #define SOF_NET_MAGIC			0x534F4652U /* 'SOFR' */
 #define SOF_NET_VERSION			1
 #define SOF_NET_DEFAULT_PORT		9998
+
+/*
+ * High bit in sof_net_hdr.opcode indicates SOFZ-compressed payload.
+ * Clients set this bit in request opcode (or SOF_TELEM_FL_COMPRESS in
+ * telemetry flags) to advertise decompression support; servers set it
+ * in reply opcode when the reply payload is SOFZ-compressed.
+ */
+#define SOF_NET_OP_FLAG_COMPRESSED	0x8000U
+#define SOF_NET_OP_MASK			0x7FFFU
+#define SOF_NET_COMP_MAGIC		0x5A464F53U /* 'SOFZ' */
+
+struct sof_net_comp_hdr {
+	uint32_t magic;		/* SOF_NET_COMP_MAGIC ('SOFZ') */
+	uint32_t raw_size;	/* Uncompressed payload byte length */
+} __attribute__((packed));
 
 enum sof_net_opcode {
 	SOF_NET_OP_PING			= 0x0000,
@@ -239,7 +340,17 @@ struct sof_net_winstream_rsp {
 #define SOF_TELEM_FL_EXT_PERF_TLV	(1U << 5)
 #define SOF_TELEM_FL_MODULES_INFO_TLV	(1U << 6)
 #define SOF_TELEM_FL_SYS_HOST_STATS	(1U << 7)
+#define SOF_TELEM_FL_TEL2_SLOT		(1U << 8)
+#define SOF_TELEM_FL_PMW2_WIN3		(1U << 9)
+#define SOF_TELEM_FL_HOT_ONLY		(1U << 10)
+#define SOF_TELEM_FL_COMPRESS		(1U << 14)
 #define SOF_TELEM_FL_WAKE_DSP		(1U << 15)
+
+/* Hot-zone byte length in MW2 Slot 1 (0x0000..0x023F: ticks + TEL2 hdr + hot_line0 + gw_hot[16]) */
+#define SOF_TEL_HOT_ZONE_BYTES		0x0240U
+
+/* Base v1 snapshot size before TEL2/PMW2 extension fields */
+#define SOF_NET_TELEM_SNAPSHOT_V1_SIZE	16356U
 
 struct sof_net_telem_req {
 	uint32_t query_mask;
@@ -261,7 +372,331 @@ struct sof_net_telem_snapshot {
 	uint8_t  ext_perf_tlv[4096];
 	uint32_t modules_info_len;
 	uint8_t  modules_info_tlv[4096];
+	/* Extended TEL2 (MW2 Slot 1, 4 KB) & PMW2 (MW3, 8 KB) windows */
+	uint32_t tel2_slot_len;
+	uint8_t  tel2_slot[4096];
+	uint32_t pmw2_win3_len;
+	uint8_t  pmw2_win3[8192];
 };
+
+/* -------------------------------------------------------------------------
+ * Extended Memory Window 2 ("TEL2") & Memory Window 3 ("PMW2") Wire Format
+ * Matches SOF DSP telemetry.h & performance_monitor.h cache-line layout.
+ * Note: /sys/kernel/debug/sof/exception skips the first 4-byte separator_1,
+ * placing sof_tel_ext_hdr at file offset 0x00FC instead of slot offset 0x0100.
+ * -------------------------------------------------------------------------
+ */
+#define SOF_TEL_EXT_MAGIC		0x324C4554U /* "TEL2" */
+#define SOF_TEL_EXT_VERSION		1U
+#define SOF_TEL_EXT_HDR_OFFSET		0x0100U
+#define SOF_TEL_EXT_DEBUGFS_HDR_OFFSET	0x00FCU
+#define SOF_TEL_MAX_CORES		5U
+#define SOF_TEL_MAX_SECTIONS		6U
+#define SOF_TEL_MAX_HEAPS		6U
+#define SOF_TEL_MAX_VMH_BUNDLES		10U
+#define SOF_TEL_MAX_VPAGE_ELEMS		16U
+#define SOF_TEL_MAX_VREGIONS		16U
+#define SOF_TEL_MAX_PIPELINES		16U
+#define SOF_TEL_MAX_GATEWAYS		16U
+#define SOF_TEL_MAX_THREADS		32U
+
+/* Canonical MW2 Slot 1 section offsets (64-byte cache-line aligned) */
+#define SOF_TEL_OFF_HOT_LINE0		0x0140U
+#define SOF_TEL_OFF_GW_HOT		0x0180U
+#define SOF_TEL_OFF_MEM_SEC		0x0240U
+#define SOF_TEL_OFF_VREG_SEC		0x0340U
+#define SOF_TEL_OFF_PPL_SEC		0x0540U
+#define SOF_TEL_OFF_DAI_SEC		0x06C0U
+#define SOF_TEL_OFF_THD_SEC		0x07C0U
+
+enum sof_tel_section_id {
+	SOF_TEL_SEC_HOT_ZONE	= 1,
+	SOF_TEL_SEC_MEMORY	= 2,
+	SOF_TEL_SEC_VREGION	= 3,
+	SOF_TEL_SEC_PIPELINES	= 4,
+	SOF_TEL_SEC_DAIS	= 5,
+	SOF_TEL_SEC_THREADS	= 6,
+};
+
+enum sof_tel_heap_type {
+	SOF_TEL_HEAP_NONE	= 0,
+	SOF_TEL_HEAP_SYS	= 1,
+	SOF_TEL_HEAP_SHARED	= 2,
+	SOF_TEL_HEAP_LL_USER	= 3,
+	SOF_TEL_HEAP_L3_IMR	= 4,
+	SOF_TEL_HEAP_DRV_USER	= 5,
+};
+
+enum sof_tel_gw_type {
+	SOF_TEL_GW_NONE		= 0,
+	SOF_TEL_GW_SSP		= 1,
+	SOF_TEL_GW_DMIC		= 2,
+	SOF_TEL_GW_ALH		= 3,
+	SOF_TEL_GW_HDA		= 4,
+	SOF_TEL_GW_HOST_DMA	= 5,
+	SOF_TEL_GW_OTHER	= 6,
+};
+
+struct sof_tel_sec_desc {
+	uint8_t  id;
+	uint8_t  elem_size;
+	uint16_t offset;
+	uint16_t max_count;
+	uint16_t active_mask;
+} __attribute__((packed));
+
+struct sof_tel_ext_hdr {
+	uint32_t magic;
+	uint8_t  version;
+	uint8_t  max_cores;
+	uint16_t num_secs;
+	uint32_t seq;
+	uint32_t timestamp_us;
+	struct sof_tel_sec_desc secs[SOF_TEL_MAX_SECTIONS];
+} __attribute__((packed));
+
+struct sof_tel_hot_line0 {
+	uint16_t ll_overrun_count[SOF_TEL_MAX_CORES];
+	uint16_t dp_deadline_misses[SOF_TEL_MAX_CORES];
+	uint16_t active_ll_tasks[SOF_TEL_MAX_CORES];
+	uint16_t total_xrun_events;
+	uint16_t ppl_xrun_count[SOF_TEL_MAX_PIPELINES];
+} __attribute__((packed));
+
+struct sof_tel_gw_hot {
+	uint32_t total_kb_or_frames;
+	uint16_t dma_buf_avail_bytes;
+	uint16_t xrun_or_skip_count;
+} __attribute__((packed));
+
+struct sof_tel_sram_info {
+	uint16_t hp_sram_free_pages;
+	uint16_t hp_sram_total_pages;
+	uint16_t lp_sram_free_pages;
+	uint16_t lp_sram_total_pages;
+	uint32_t ebb_power_mask_lo;
+	uint32_t ebb_power_mask_hi;
+	uint32_t lpsram_ebb_mask;
+	uint32_t rsvd;
+} __attribute__((packed));
+
+struct sof_tel_heap_info {
+	uint16_t heap_type;
+	uint16_t alloc_fail_count;
+	uint32_t total_bytes;
+	uint32_t allocated_bytes;
+	uint32_t free_bytes;
+	uint32_t max_allocated_bytes;
+} __attribute__((packed));
+
+struct sof_tel_vmh_bundle {
+	uint8_t  blk_sz_shift;
+	uint8_t  rsvd;
+	uint16_t total_blocks;
+	uint16_t used_blocks;
+	uint16_t max_blocks_or_oom;
+} __attribute__((packed));
+
+struct sof_tel_fast_get_info {
+	uint16_t active_entries;
+	uint16_t fail_count;
+	uint32_t total_sram_bytes;
+	uint32_t peak_sram_bytes;
+	uint32_t total_get_calls;
+} __attribute__((packed));
+
+struct sof_tel_mem_section {
+	struct sof_tel_sram_info sram;
+	struct sof_tel_heap_info heaps[SOF_TEL_MAX_HEAPS];
+	uint32_t vmh_region_size;
+	uint16_t vmh_bundle_count;
+	uint16_t vmh_oom_total;
+	struct sof_tel_vmh_bundle vmh_bundles[SOF_TEL_MAX_VMH_BUNDLES];
+	struct sof_tel_fast_get_info fast_get;
+	uint8_t  pad[8];
+} __attribute__((packed));
+
+struct sof_tel_valloc_elem {
+	uint16_t pages;
+	uint16_t vpage;
+} __attribute__((packed));
+
+struct sof_tel_vregion_info {
+	uint32_t base_va;
+	uint16_t total_pages;
+	uint8_t  use_count;
+	uint8_t  type_and_flags;
+	uint32_t lifetime_size_bytes;
+	uint32_t lifetime_used_bytes;
+	uint32_t interim_alloc_bytes;
+	uint16_t interim_free_kb;
+	uint16_t lifetime_free_count;
+} __attribute__((packed));
+
+struct sof_tel_vregion_section {
+	uint16_t total_pages;
+	uint16_t free_pages;
+	uint16_t min_free_pages;
+	uint16_t num_elems_in_use;
+	uint32_t alloc_fail_count;
+	uint32_t region_base_va;
+	struct sof_tel_valloc_elem velems[SOF_TEL_MAX_VPAGE_ELEMS];
+	uint16_t active_vregion_count;
+	uint16_t total_vregions_created;
+	uint8_t  pad[44];
+	struct sof_tel_vregion_info vregions[SOF_TEL_MAX_VREGIONS];
+} __attribute__((packed));
+
+struct sof_tel_core_sched {
+	uint8_t  core_id;
+	uint8_t  ll_task_count;
+	uint8_t  dp_task_count;
+	uint8_t  active_ppl_count;
+	uint32_t active_kcps_budget;
+	uint32_t rsvd;
+} __attribute__((packed));
+
+struct sof_tel_ppl_info {
+	uint16_t pipeline_id;
+	uint8_t  core;
+	uint8_t  priority;
+	uint8_t  status;
+	uint8_t  comp_count;
+	uint16_t attributes;
+	uint32_t period_us;
+	uint32_t sched_comp_id;
+	int32_t  last_xrun_bytes;
+} __attribute__((packed));
+
+struct sof_tel_ppl_section {
+	struct sof_tel_core_sched core_sched[SOF_TEL_MAX_CORES];
+	uint16_t active_ppl_count;
+	uint16_t total_comp_count;
+	struct sof_tel_ppl_info pipelines[SOF_TEL_MAX_PIPELINES];
+} __attribute__((packed));
+
+struct sof_tel_gw_cold {
+	uint8_t  gw_type;
+	uint8_t  index;
+	uint8_t  direction;
+	int8_t   dma_chan;
+	uint16_t comp_id;
+	uint8_t  state;
+	uint8_t  group_id;
+	uint32_t period_bytes;
+	uint32_t dma_buf_size;
+} __attribute__((packed));
+
+struct sof_tel_dai_section {
+	struct sof_tel_gw_cold gateways[SOF_TEL_MAX_GATEWAYS];
+} __attribute__((packed));
+
+#define SOF_TEL_THD_FLG_IDLE	(1U << 0)
+#define SOF_TEL_THD_FLG_USER	(1U << 1)
+#define SOF_TEL_THD_FLG_DP	(1U << 2)
+#define SOF_TEL_THD_FLG_LL	(1U << 3)
+
+struct sof_tel_thread_info {
+	uint32_t thread_id;
+	uint8_t  core;
+	int8_t   prio;
+	uint8_t  state;
+	uint8_t  cpu_load;
+	uint8_t  stack_usage;
+	uint8_t  flags;
+	uint16_t stack_size_chunks;
+	uint32_t total_exec_kcycles;
+	char     name[8];
+} __attribute__((packed));
+
+struct sof_tel_thread_section {
+	uint8_t  core_load[8];
+	uint16_t thread_count;
+	uint16_t dropped_threads;
+	uint32_t sample_seq;
+	uint32_t rsvd[4];
+	struct sof_tel_thread_info threads[SOF_TEL_MAX_THREADS];
+	uint8_t  pad[32];
+} __attribute__((packed));
+
+/* Memory Window 3 ("PMW2") constants & structures (8,192 B window) */
+#define SOF_TEL_MW3_MAGIC		0x32574D50U /* "PMW2" */
+#define SOF_TEL_MW3_VERSION		1U
+#define SOF_TEL_MW3_MAX_COMP_ITEMS	88U
+#define SOF_TEL_MW3_MAX_IO_ITEMS	128U
+#define SOF_TEL_MW3_COMP_PERF_STRIDE	48U
+#define SOF_TEL_MW3_MOD_HOT_OFFSET	0x1080U
+#define SOF_TEL_MW3_MOD_COLD_OFFSET	0x1200U
+#define SOF_TEL_MW3_IO_PERF_OFFSET	0x1800U
+#define SOF_TEL_MW3_HDR_OFFSET		0x1FC0U
+
+/* Native 48-byte DSP MW3 component performance record (88 * 48 = 0x1080) */
+struct sof_tel_mw3_comp_perf {
+	uint32_t resource_id;
+	uint32_t power_mode : 1;
+	uint32_t rsvd       : 30;
+	uint32_t is_removed : 1;
+	uint32_t peak_kcps;
+	uint32_t avg_kcps;
+	uint32_t total_iteration_count;
+	uint64_t total_cycles_consumed;
+	uint32_t restricted_peak_cycles;
+	uint64_t restricted_total_iterations;
+	uint64_t restricted_total_cycles;
+} __attribute__((packed));
+
+struct sof_tel_mod_hot {
+	uint16_t cpc_violation_count;
+	uint16_t xrun_count;
+} __attribute__((packed));
+
+struct sof_tel_mod_cold {
+	uint32_t resource_id;
+	uint32_t heap_usage;
+	uint32_t heap_high_water_mark;
+	uint32_t configured_cpc;
+} __attribute__((packed));
+
+struct sof_tel_io_perf_item {
+	uint32_t resource_id;
+	uint32_t power_mode;
+	uint32_t perf_usage;
+} __attribute__((packed));
+
+struct sof_tel_mw3_hdr {
+	uint32_t magic;
+	uint16_t version;
+	uint16_t max_comp_entries;
+	uint16_t max_io_entries;
+	uint16_t mod_hot_offset;
+	uint16_t mod_cold_offset;
+	uint16_t io_perf_offset;
+	uint8_t  rsvd[48];
+} __attribute__((packed));
+
+/**
+ * Locate the TEL2 header inside a MW2 Slot 1 or /sys/kernel/debug/sof/exception buffer.
+ * Returns the byte delta to subtract from canonical slot offsets (0 for raw 4096B slot,
+ * 4 for /sys/kernel/debug/sof/exception which skips separator_1, or -1 if not present).
+ */
+static inline int sof_tel2_slot_bias(const uint8_t *buf, uint32_t len)
+{
+	if (!buf)
+		return -1;
+	if (len >= SOF_TEL_EXT_HDR_OFFSET + sizeof(struct sof_tel_ext_hdr)) {
+		const struct sof_tel_ext_hdr *h =
+			(const struct sof_tel_ext_hdr *)(buf + SOF_TEL_EXT_HDR_OFFSET);
+		if (h->magic == SOF_TEL_EXT_MAGIC)
+			return 0;
+	}
+	if (len >= SOF_TEL_EXT_DEBUGFS_HDR_OFFSET + sizeof(struct sof_tel_ext_hdr)) {
+		const struct sof_tel_ext_hdr *h =
+			(const struct sof_tel_ext_hdr *)(buf + SOF_TEL_EXT_DEBUGFS_HDR_OFFSET);
+		if (h->magic == SOF_TEL_EXT_MAGIC)
+			return 4;
+	}
+	return -1;
+}
 
 struct sof_net_llext_req {
 	uint32_t mode;
@@ -779,5 +1214,337 @@ struct sof_net_sched_trace_entry {
 	int32_t  ret_status;
 	char     widget_name[32];
 } __attribute__((packed));
+
+/*
+ * Resolve an SSH Host alias (e.g. "damsel-fly", "aphid", "dragon-fly", "spider")
+ * from ~/.ssh/config to its HostName when DNS/getaddrinfo does not resolve it.
+ */
+static inline const char *sof_resolve_ssh_host(const char *host, char *buf, size_t cap)
+{
+	if (!host || !buf || cap < 2)
+		return host;
+
+	const char *home = getenv("HOME");
+	if (!home || !home[0])
+		return host;
+
+	char path[512];
+	snprintf(path, sizeof(path), "%s/.ssh/config", home);
+	FILE *fp = fopen(path, "r");
+	if (!fp)
+		return host;
+
+	bool in_match = false;
+	char line[512];
+	while (fgets(line, sizeof(line), fp)) {
+		char *p = line;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0')
+			continue;
+
+		if (strncasecmp(p, "Host ", 5) == 0 || strncasecmp(p, "Host\t", 5) == 0) {
+			in_match = false;
+			char *tok_ctx = NULL;
+			char *tok = strtok_r(p + 5, " \t\r\n", &tok_ctx);
+			while (tok) {
+				if (strcmp(tok, host) == 0) {
+					in_match = true;
+					break;
+				}
+				tok = strtok_r(NULL, " \t\r\n", &tok_ctx);
+			}
+		} else if (in_match &&
+			   (strncasecmp(p, "HostName ", 9) == 0 ||
+			    strncasecmp(p, "HostName\t", 9) == 0)) {
+			char *tok_ctx = NULL;
+			char *hn = strtok_r(p + 9, " \t\r\n", &tok_ctx);
+			if (hn && hn[0]) {
+				snprintf(buf, cap, "%s", hn);
+				fclose(fp);
+				return buf;
+			}
+		}
+	}
+
+	fclose(fp);
+	return host;
+}
+
+/*
+ * SOFZ Wire Payload Compressor & Decompressor
+ *
+ * Token encoding after 8-byte struct sof_net_comp_hdr ('SOFZ' + raw_size):
+ *   0x00 + u16_le(len) : Long zero run (1..65535 zero bytes)
+ *   0x01..0x3F         : Short zero run (1..63 zero bytes, length = token)
+ *   0x40..0x7F + bytes : Literal run (1..64 bytes, length = (token & 0x3F) + 1)
+ *   0x80..0xBF + byte  : Repeat byte run (3..66 copies, length = (token & 0x3F) + 3)
+ *   0xC0..0xFF + u16_le: LZ77 back-reference (4..67 bytes, length = (token & 0x3F) + 4,
+ *                        distance = 1..65535 bytes back in output buffer)
+ *
+ * Returns compressed byte size (including 8B header) on success, or 0 if output
+ * does not fit in dst_cap.
+ */
+static inline uint32_t sof_net_compress(const uint8_t *src, uint32_t src_len,
+					uint8_t *dst, uint32_t dst_cap)
+{
+	if (!src || !dst || src_len == 0 || src_len > (16U * 1024U * 1024U) ||
+	    dst_cap <= sizeof(struct sof_net_comp_hdr))
+		return 0;
+
+	struct sof_net_comp_hdr chdr = {
+		.magic    = SOF_NET_COMP_MAGIC,
+		.raw_size = src_len,
+	};
+	memcpy(dst, &chdr, sizeof(chdr));
+
+	uint32_t out = (uint32_t)sizeof(chdr);
+	uint32_t htab[1024];
+	memset(htab, 0, sizeof(htab));
+
+	uint32_t lit_start = 0;
+	uint32_t lit_len = 0;
+	uint32_t i = 0;
+
+	while (i < src_len) {
+		/* 1. Check zero run */
+		if (src[i] == 0) {
+			uint32_t zlen = 1;
+			while (i + zlen < src_len && src[i + zlen] == 0 && zlen < 65535U)
+				zlen++;
+			if (zlen >= 3 || (zlen >= 1 && lit_len == 0)) {
+				if (lit_len > 0) {
+					if (out + 1 + lit_len > dst_cap)
+						return 0;
+					dst[out++] = (uint8_t)(0x40U | (lit_len - 1U));
+					memcpy(dst + out, src + lit_start, lit_len);
+					out += lit_len;
+					lit_len = 0;
+				}
+				if (zlen <= 63U) {
+					if (out + 1 > dst_cap)
+						return 0;
+					dst[out++] = (uint8_t)zlen;
+				} else {
+					if (out + 3 > dst_cap)
+						return 0;
+					dst[out++] = 0x00U;
+					dst[out++] = (uint8_t)(zlen & 0xFFU);
+					dst[out++] = (uint8_t)((zlen >> 8) & 0xFFU);
+				}
+				i += zlen;
+				continue;
+			}
+		}
+
+		/* 2. Check repeat non-zero byte run (3..66) */
+		if (src[i] != 0 && i + 3 <= src_len &&
+		    src[i] == src[i + 1] && src[i] == src[i + 2]) {
+			uint32_t rlen = 3;
+			while (i + rlen < src_len && src[i + rlen] == src[i] && rlen < 66U)
+				rlen++;
+			if (lit_len > 0) {
+				if (out + 1 + lit_len > dst_cap)
+					return 0;
+				dst[out++] = (uint8_t)(0x40U | (lit_len - 1U));
+				memcpy(dst + out, src + lit_start, lit_len);
+				out += lit_len;
+				lit_len = 0;
+			}
+			if (out + 2 > dst_cap)
+				return 0;
+			dst[out++] = (uint8_t)(0x80U | (rlen - 3U));
+			dst[out++] = src[i];
+			i += rlen;
+			continue;
+		}
+
+		/* 3. Check 4-byte LZ77 back-reference (4..67 bytes) */
+		if (i + 4 <= src_len) {
+			uint32_t v4;
+			memcpy(&v4, src + i, 4);
+			uint32_t h = (v4 * 2654435761U) >> 22;
+			uint32_t ref = htab[h];
+			htab[h] = i + 1U;
+			if (ref > 0) {
+				uint32_t mpos = ref - 1U;
+				uint32_t dist = i - mpos;
+				if (dist > 0 && dist <= 65535U &&
+				    memcmp(src + mpos, src + i, 4) == 0) {
+					uint32_t mlen = 4;
+					while (mlen < 67U && i + mlen < src_len &&
+					       src[mpos + mlen] == src[i + mlen])
+						mlen++;
+					if (lit_len > 0) {
+						if (out + 1 + lit_len > dst_cap)
+							return 0;
+						dst[out++] = (uint8_t)(0x40U | (lit_len - 1U));
+						memcpy(dst + out, src + lit_start, lit_len);
+						out += lit_len;
+						lit_len = 0;
+					}
+					if (out + 3 > dst_cap)
+						return 0;
+					dst[out++] = (uint8_t)(0xC0U | (mlen - 4U));
+					dst[out++] = (uint8_t)(dist & 0xFFU);
+					dst[out++] = (uint8_t)((dist >> 8) & 0xFFU);
+					i += mlen;
+					continue;
+				}
+			}
+		}
+
+		/* 4. Accumulate literal byte */
+		if (lit_len == 0)
+			lit_start = i;
+		lit_len++;
+		i++;
+		if (lit_len == 64U) {
+			if (out + 1 + lit_len > dst_cap)
+				return 0;
+			dst[out++] = (uint8_t)(0x40U | (lit_len - 1U));
+			memcpy(dst + out, src + lit_start, lit_len);
+			out += lit_len;
+			lit_len = 0;
+		}
+	}
+
+	if (lit_len > 0) {
+		if (out + 1 + lit_len > dst_cap)
+			return 0;
+		dst[out++] = (uint8_t)(0x40U | (lit_len - 1U));
+		memcpy(dst + out, src + lit_start, lit_len);
+		out += lit_len;
+	}
+
+	return out;
+}
+
+static inline int sof_net_decompress(const uint8_t *src, uint32_t src_len,
+				     uint8_t **out_buf, uint32_t *out_len)
+{
+	if (!src || !out_buf || !out_len || src_len < sizeof(struct sof_net_comp_hdr))
+		return -1;
+
+	struct sof_net_comp_hdr chdr;
+	memcpy(&chdr, src, sizeof(chdr));
+	if (chdr.magic != SOF_NET_COMP_MAGIC || chdr.raw_size > (16U * 1024U * 1024U))
+		return -1;
+
+	uint8_t *dst = (uint8_t *)calloc(1, chdr.raw_size + 1U);
+	if (!dst)
+		return -1;
+
+	uint32_t in = (uint32_t)sizeof(chdr);
+	uint32_t out = 0;
+
+	while (in < src_len && out < chdr.raw_size) {
+		uint8_t tok = src[in++];
+		uint8_t tag = (uint8_t)(tok >> 6);
+
+		if (tag == 0) {
+			uint32_t zlen = tok;
+			if (zlen == 0) {
+				if (in + 2 > src_len) {
+					free(dst);
+					return -1;
+				}
+				zlen = (uint32_t)src[in] | ((uint32_t)src[in + 1] << 8);
+				in += 2;
+			}
+			if (zlen == 0 || out + zlen > chdr.raw_size) {
+				free(dst);
+				return -1;
+			}
+			/* dst is already zero-initialized by calloc */
+			out += zlen;
+		} else if (tag == 1) {
+			uint32_t llen = (uint32_t)(tok & 0x3FU) + 1U;
+			if (in + llen > src_len || out + llen > chdr.raw_size) {
+				free(dst);
+				return -1;
+			}
+			memcpy(dst + out, src + in, llen);
+			in += llen;
+			out += llen;
+		} else if (tag == 2) {
+			uint32_t rlen = (uint32_t)(tok & 0x3FU) + 3U;
+			if (in + 1 > src_len || out + rlen > chdr.raw_size) {
+				free(dst);
+				return -1;
+			}
+			memset(dst + out, src[in++], rlen);
+			out += rlen;
+		} else {
+			uint32_t mlen = (uint32_t)(tok & 0x3FU) + 4U;
+			if (in + 2 > src_len) {
+				free(dst);
+				return -1;
+			}
+			uint32_t dist = (uint32_t)src[in] | ((uint32_t)src[in + 1] << 8);
+			in += 2;
+			if (dist == 0 || dist > out || out + mlen > chdr.raw_size) {
+				free(dst);
+				return -1;
+			}
+			uint32_t mpos = out - dist;
+			for (uint32_t k = 0; k < mlen; k++)
+				dst[out + k] = dst[mpos + k];
+			out += mlen;
+		}
+	}
+
+	if (out != chdr.raw_size) {
+		free(dst);
+		return -1;
+	}
+
+	*out_buf = dst;
+	*out_len = chdr.raw_size;
+	return 0;
+}
+
+/**
+ * Reconstruct the 4,096 B legacy perf_win3 (32-byte records with 64-bit
+ * iteration counts and bit-1 is_removed) from a PMW2 Window 3 buffer
+ * (88 x 48-byte native struct sof_tel_mw3_comp_perf records).
+ */
+static inline void sof_tel_pmw2_to_legacy_win3(uint8_t *dst_win3,
+					       const uint8_t *src_pmw2)
+{
+	if (!dst_win3 || !src_pmw2)
+		return;
+	for (uint32_t b = 0; b < 4096U; b++) {
+		if (dst_win3[b] != 0)
+			return;
+	}
+	memset(dst_win3, 0, 4096);
+	for (uint32_t i = 0; i < SOF_TEL_MW3_MAX_COMP_ITEMS; i++) {
+		const struct sof_tel_mw3_comp_perf *src =
+			(const struct sof_tel_mw3_comp_perf *)
+			(src_pmw2 + i * SOF_TEL_MW3_COMP_PERF_STRIDE);
+		struct {
+			uint32_t resource_id;
+			uint32_t power_mode : 1;
+			uint32_t is_removed : 1;
+			uint32_t rsvd       : 30;
+			uint32_t peak_kcps;
+			uint32_t avg_kcps;
+			uint64_t total_iteration_count;
+			uint64_t total_cycles_consumed;
+		} __attribute__((packed)) *dst =
+			(void *)(dst_win3 + i * 32U);
+
+		dst->resource_id = src->resource_id;
+		dst->power_mode = src->power_mode;
+		dst->is_removed = src->is_removed;
+		dst->rsvd = 0;
+		dst->peak_kcps = src->peak_kcps;
+		dst->avg_kcps = src->avg_kcps;
+		dst->total_iteration_count =
+			(((uint64_t)src->rsvd) << 32) | src->total_iteration_count;
+		dst->total_cycles_consumed = src->total_cycles_consumed;
+	}
+}
 
 #endif /* _TESTBENCH_SOF_REMOTE_PROTO_H */

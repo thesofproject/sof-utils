@@ -76,8 +76,13 @@ static int connect_server(const char *host, int port)
 	hints.ai_socktype = SOCK_STREAM;
 	snprintf(port_str, sizeof(port_str), "%d", port);
 
-	if (getaddrinfo(host, port_str, &hints, &res) != 0)
-		return -1;
+	if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+		char ssh_host[128];
+		const char *alt = sof_resolve_ssh_host(host, ssh_host, sizeof(ssh_host));
+
+		if (alt == host || getaddrinfo(alt, port_str, &hints, &res) != 0)
+			return -1;
+	}
 
 	for (rp = res; rp != NULL; rp = rp->ai_next) {
 		sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
@@ -96,12 +101,20 @@ static int connect_server(const char *host, int port)
 }
 
 static int rpc_call(int sock, uint16_t opcode, const void *req_payload, uint32_t req_len,
+		    struct sof_net_hdr *rsp_hdr_out, uint8_t **rsp_payload_out);
+static uint32_t g_last_wire_bytes;
+static uint32_t g_last_raw_bytes;
+static bool g_server_no_compress;
+
+static int rpc_call(int sock, uint16_t opcode, const void *req_payload, uint32_t req_len,
 		    struct sof_net_hdr *rsp_hdr_out, uint8_t **rsp_payload_out)
 {
+	uint16_t wire_op = g_server_no_compress ? opcode :
+			   (uint16_t)(opcode | SOF_NET_OP_FLAG_COMPRESSED);
 	struct sof_net_hdr req_hdr = {
 		.magic       = SOF_NET_MAGIC,
 		.version     = SOF_NET_VERSION,
-		.opcode      = opcode,
+		.opcode      = wire_op,
 		.req_id      = g_req_seq++,
 		.payload_len = req_payload ? req_len : 0,
 		.status      = 0,
@@ -124,6 +137,15 @@ static int rpc_call(int sock, uint16_t opcode, const void *req_payload, uint32_t
 	if (rsp_hdr.magic != SOF_NET_MAGIC)
 		return -EPROTO;
 
+	/* Fallback for older servers that do not recognize SOF_NET_OP_FLAG_COMPRESSED */
+	if (rsp_hdr.status == -ENOSYS && !g_server_no_compress && rsp_hdr.payload_len == 0) {
+		g_server_no_compress = true;
+		return rpc_call(sock, opcode, req_payload, req_len, rsp_hdr_out, rsp_payload_out);
+	}
+
+	g_last_wire_bytes = rsp_hdr.payload_len;
+	g_last_raw_bytes = rsp_hdr.payload_len;
+
 	if (rsp_hdr.payload_len > 0) {
 		buf = calloc(1, rsp_hdr.payload_len + 1);
 		if (!buf)
@@ -133,6 +155,33 @@ static int rpc_call(int sock, uint16_t opcode, const void *req_payload, uint32_t
 			return -EIO;
 		}
 		buf[rsp_hdr.payload_len] = '\0';
+
+		if ((rsp_hdr.opcode & SOF_NET_OP_FLAG_COMPRESSED) &&
+		    rsp_hdr.payload_len >= sizeof(struct sof_net_comp_hdr)) {
+			uint8_t *dbuf = NULL;
+			uint32_t dlen = 0;
+
+			if (sof_net_decompress(buf, rsp_hdr.payload_len, &dbuf, &dlen) != 0) {
+				free(buf);
+				return -EPROTO;
+			}
+			free(buf);
+			buf = dbuf;
+			rsp_hdr.payload_len = dlen;
+			rsp_hdr.opcode &= SOF_NET_OP_MASK;
+			g_last_raw_bytes = dlen;
+
+			if (rsp_hdr.opcode == SOF_NET_OP_TELEM_SNAPSHOT &&
+			    dlen >= sizeof(struct sof_net_telem_snapshot)) {
+				struct sof_net_telem_snapshot *sn =
+					(struct sof_net_telem_snapshot *)buf;
+
+				if (sn->flags_present & SOF_TELEM_FL_PMW2_WIN3)
+					sof_tel_pmw2_to_legacy_win3(sn->perf_win3, sn->pmw2_win3);
+			}
+		}
+	} else {
+		rsp_hdr.opcode &= SOF_NET_OP_MASK;
 	}
 
 	if (rsp_hdr_out)
@@ -678,27 +727,328 @@ static int dispatch_command(int sock, int argc, char **argv)
 	}
 
 	if (strcmp(cmd, "telem") == 0) {
+		bool hot_req = (argc > 1 &&
+				(strcmp(argv[1], "--hot") == 0 || strcmp(argv[1], "hot") == 0));
+		uint32_t qmask = (argc > 1 && !hot_req) ?
+				 (uint32_t)strtoul(argv[1], NULL, 0) :
+				 (hot_req ?
+				  (SOF_TELEM_FL_FW_REGS | SOF_TELEM_FL_TELEM_SLOT |
+				   SOF_TELEM_FL_PERF_WIN3 | SOF_TELEM_FL_TEL2_SLOT |
+				   SOF_TELEM_FL_PMW2_WIN3 | SOF_TELEM_FL_HOT_ONLY) :
+				  (0x7FU | SOF_TELEM_FL_TEL2_SLOT | SOF_TELEM_FL_PMW2_WIN3));
 		struct sof_net_telem_req treq = {
-			.query_mask = (argc > 1) ? (uint32_t)strtoul(argv[1], NULL, 0) : 0x7FU,
-			.flags      = 0,
+			.query_mask = qmask,
+			.flags      = SOF_TELEM_FL_WAKE_DSP | SOF_TELEM_FL_COMPRESS |
+				      (hot_req ? SOF_TELEM_FL_HOT_ONLY : 0),
 		};
 		st = rpc_call(sock, SOF_NET_OP_TELEM_SNAPSHOT, &treq, sizeof(treq), &rhdr, &rbuf);
-		if (st == 0 && rbuf && rhdr.payload_len >= sizeof(struct sof_net_telem_snapshot)) {
+		if (st == 0 && rbuf && rhdr.payload_len >= SOF_NET_TELEM_SNAPSHOT_V1_SIZE) {
 			const struct sof_net_telem_snapshot *sn =
 				(const struct sof_net_telem_snapshot *)rbuf;
 			const uint32_t *r32 = (const uint32_t *)sn->fw_regs;
+			int i;
+			double saved_pct = g_last_raw_bytes > 0 ?
+					   100.0 * (1.0 - (double)g_last_wire_bytes /
+							  (double)g_last_raw_bytes) : 0.0;
 
 			printf("=== SOF Composite Telemetry Snapshot ===\n"
 			       "  Platform:       %s (Topology: %s)\n"
-			       "  Flags Present:  0x%02x, Active PCM Streams: %u\n"
+			       "  Wire Payload:   %u B (%s, %.1f%% reduction from %u B raw)\n"
+			       "  Flags Present:  0x%03x, Active PCM Streams: %u\n"
 			       "  FW Regs:        fw_status=0x%08x fps=0x%08x ticks=%u\n"
 			       "  TLV Sizes:      mem=%uB pwr=%uB ext_perf=%uB modules=%uB\n",
 			       sn->dev_info.platform,
 			       sn->dev_info.fw_filename[0] ? sn->dev_info.fw_filename : "(none)",
+			       g_last_wire_bytes,
+			       (sn->flags_present & SOF_TELEM_FL_HOT_ONLY) ? "SOFZ+HOT_ONLY" : "SOFZ",
+			       saved_pct, g_last_raw_bytes,
 			       sn->flags_present, sn->active_pcm_streams,
 			       r32[0], r32[2], r32[4],
 			       sn->mem_state_len, sn->pwr_state_len,
 			       sn->ext_perf_len, sn->modules_info_len);
+
+			if (sn->flags_present & SOF_TELEM_FL_TELEM_SLOT) {
+				uint32_t sep = *(const uint32_t *)sn->telem_slot;
+				int max_c = sn->dev_info.num_cores ?
+					    (int)sn->dev_info.num_cores : (int)SOF_TEL_MAX_CORES;
+
+				printf("  [Systick Core Telemetry (sep=0x%08x)]\n", sep);
+				for (i = 0; i < max_c &&
+					    4U + (size_t)(i + 1) * 32U <= sizeof(sn->telem_slot);
+				     i++) {
+					const uint32_t *c =
+						(const uint32_t *)(sn->telem_slot + 4 + i * 32);
+
+					if (c[0] == 0 && c[4] == 0 && i > 0)
+						continue;
+					printf("    Core %d: ticks=%u last_cyc=%u max_cyc=%u avg_kcps=%u peak_kcps=%u\n",
+					       i, c[0], c[1], c[2], c[4], c[5]);
+				}
+			}
+
+			/* Check extended TEL2 slot (MW2 Slot 1) */
+			const uint8_t *t2_buf = NULL;
+			uint32_t t2_len = 0;
+
+			if (rhdr.payload_len >= sizeof(struct sof_net_telem_snapshot) &&
+			    (sn->flags_present & SOF_TELEM_FL_TEL2_SLOT) &&
+			    sn->tel2_slot_len > 0) {
+				t2_buf = sn->tel2_slot;
+				t2_len = sn->tel2_slot_len <= sizeof(sn->tel2_slot) ?
+					 sn->tel2_slot_len : (uint32_t)sizeof(sn->tel2_slot);
+			} else if (sn->flags_present & SOF_TELEM_FL_TELEM_SLOT) {
+				t2_buf = sn->telem_slot;
+				t2_len = sizeof(sn->telem_slot);
+			}
+
+			int bias = sof_tel2_slot_bias(t2_buf, t2_len);
+
+			if (bias >= 0) {
+				const struct sof_tel_ext_hdr *eh =
+					(const struct sof_tel_ext_hdr *)
+					(t2_buf + SOF_TEL_EXT_HDR_OFFSET - bias);
+
+				printf("  [MW2 Slot 1 Extended Telemetry 'TEL2' v%u (cores=%u, secs=%u, seq=%u, ts=%u us, bias=-%dB)]\n",
+				       eh->version, eh->max_cores, eh->num_secs,
+				       eh->seq, eh->timestamp_us, bias);
+
+				if (SOF_TEL_OFF_HOT_LINE0 - (uint32_t)bias +
+				    sizeof(struct sof_tel_hot_line0) <= t2_len) {
+					const struct sof_tel_hot_line0 *h0 =
+						(const struct sof_tel_hot_line0 *)
+						(t2_buf + SOF_TEL_OFF_HOT_LINE0 - bias);
+
+					printf("    Hot Zone: total_xruns=%u | Core LL overruns=[%u,%u,%u,%u,%u] DP misses=[%u,%u,%u,%u,%u] LL tasks=[%u,%u,%u,%u,%u]\n",
+					       h0->total_xrun_events,
+					       h0->ll_overrun_count[0], h0->ll_overrun_count[1],
+					       h0->ll_overrun_count[2], h0->ll_overrun_count[3],
+					       h0->ll_overrun_count[4],
+					       h0->dp_deadline_misses[0], h0->dp_deadline_misses[1],
+					       h0->dp_deadline_misses[2], h0->dp_deadline_misses[3],
+					       h0->dp_deadline_misses[4],
+					       h0->active_ll_tasks[0], h0->active_ll_tasks[1],
+					       h0->active_ll_tasks[2], h0->active_ll_tasks[3],
+					       h0->active_ll_tasks[4]);
+				}
+
+				if (SOF_TEL_OFF_MEM_SEC - (uint32_t)bias +
+				    sizeof(struct sof_tel_mem_section) <= t2_len) {
+					const struct sof_tel_mem_section *ms =
+						(const struct sof_tel_mem_section *)
+						(t2_buf + SOF_TEL_OFF_MEM_SEC - bias);
+					static const char * const hnames[] = {
+						"NONE", "SYS", "SHARED", "LL_USER", "L3_IMR", "DRV_USER"
+					};
+
+					printf("    Memory & SRAM: HP free=%u/%u pages, LP free=%u/%u pages, EBB=0x%04x%08x, VMH=%uB (%u bundles, oom=%u), fast_get=%u (%uB)\n",
+					       ms->sram.hp_sram_free_pages,
+					       ms->sram.hp_sram_total_pages,
+					       ms->sram.lp_sram_free_pages,
+					       ms->sram.lp_sram_total_pages,
+					       ms->sram.ebb_power_mask_hi,
+					       ms->sram.ebb_power_mask_lo,
+					       ms->vmh_region_size, ms->vmh_bundle_count,
+					       ms->vmh_oom_total,
+					       ms->fast_get.active_entries,
+					       ms->fast_get.total_sram_bytes);
+					for (i = 0; i < (int)SOF_TEL_MAX_HEAPS; i++) {
+						const struct sof_tel_heap_info *hi = &ms->heaps[i];
+
+						if (!hi->heap_type && !hi->total_bytes)
+							continue;
+						const char *hn = hi->heap_type < 6 ?
+								 hnames[hi->heap_type] : "OTHER";
+
+						printf("      Heap[%d] %-8s: alloc=%7uB free=%7uB peak=%7uB total=%7uB fails=%u\n",
+						       i, hn, hi->allocated_bytes, hi->free_bytes,
+						       hi->max_allocated_bytes, hi->total_bytes,
+						       hi->alloc_fail_count);
+					}
+				}
+
+				if (SOF_TEL_OFF_VREG_SEC - (uint32_t)bias +
+				    sizeof(struct sof_tel_vregion_section) <= t2_len) {
+					const struct sof_tel_vregion_section *vs =
+						(const struct sof_tel_vregion_section *)
+						(t2_buf + SOF_TEL_OFF_VREG_SEC - bias);
+
+					printf("    Vregions: vpages free=%u/%u (min_free=%u, base_va=0x%08x, active_vreg=%u/%u, fails=%u)\n",
+					       vs->free_pages, vs->total_pages, vs->min_free_pages,
+					       vs->region_base_va, vs->active_vregion_count,
+					       vs->total_vregions_created, vs->alloc_fail_count);
+				}
+
+				if (SOF_TEL_OFF_PPL_SEC - (uint32_t)bias +
+				    sizeof(struct sof_tel_ppl_section) <= t2_len) {
+					const struct sof_tel_ppl_section *ps =
+						(const struct sof_tel_ppl_section *)
+						(t2_buf + SOF_TEL_OFF_PPL_SEC - bias);
+
+					printf("    Pipelines: active=%u, total_comps=%u\n",
+					       ps->active_ppl_count, ps->total_comp_count);
+					for (i = 0; i < (int)ps->active_ppl_count &&
+						    i < (int)SOF_TEL_MAX_PIPELINES; i++) {
+						const struct sof_tel_ppl_info *pi = &ps->pipelines[i];
+
+						printf("      PPL[%d] id=%u core=%u prio=%u status=%u comps=%u period=%u us sched_comp=0x%x\n",
+						       i, pi->pipeline_id, pi->core, pi->priority,
+						       pi->status, pi->comp_count, pi->period_us,
+						       pi->sched_comp_id);
+					}
+				}
+
+				if (SOF_TEL_OFF_DAI_SEC - (uint32_t)bias +
+				    sizeof(struct sof_tel_dai_section) <= t2_len &&
+				    SOF_TEL_OFF_GW_HOT - (uint32_t)bias +
+				    sizeof(struct sof_tel_gw_hot) * SOF_TEL_MAX_GATEWAYS <= t2_len) {
+					const struct sof_tel_dai_section *ds =
+						(const struct sof_tel_dai_section *)
+						(t2_buf + SOF_TEL_OFF_DAI_SEC - bias);
+					const struct sof_tel_gw_hot *gh =
+						(const struct sof_tel_gw_hot *)
+						(t2_buf + SOF_TEL_OFF_GW_HOT - bias);
+					static const char * const gwnames[] = {
+						"NONE", "SSP", "DMIC", "ALH", "HDA", "HOST_DMA", "OTHER"
+					};
+
+					for (i = 0; i < (int)SOF_TEL_MAX_GATEWAYS; i++) {
+						const struct sof_tel_gw_cold *gc = &ds->gateways[i];
+
+						if (!gc->gw_type)
+							continue;
+						const char *gn = gc->gw_type < 7 ?
+								 gwnames[gc->gw_type] : "OTHER";
+
+						printf("    Gateway[%d] %-8s idx=%u dir=%s chan=%d comp=0x%04x state=%u period=%uB buf=%uB | hot: xfer=%uKB avail=%uB xruns=%u\n",
+						       i, gn, gc->index,
+						       gc->direction ? "CAP" : "PLAY",
+						       gc->dma_chan, gc->comp_id, gc->state,
+						       gc->period_bytes, gc->dma_buf_size,
+						       gh[i].total_kb_or_frames,
+						       gh[i].dma_buf_avail_bytes,
+						       gh[i].xrun_or_skip_count);
+					}
+				} else if (SOF_TEL_OFF_GW_HOT - (uint32_t)bias +
+					   sizeof(struct sof_tel_gw_hot) * SOF_TEL_MAX_GATEWAYS <= t2_len) {
+					const struct sof_tel_gw_hot *gh =
+						(const struct sof_tel_gw_hot *)
+						(t2_buf + SOF_TEL_OFF_GW_HOT - bias);
+
+					for (i = 0; i < (int)SOF_TEL_MAX_GATEWAYS; i++) {
+						if (!gh[i].total_kb_or_frames &&
+						    !gh[i].dma_buf_avail_bytes &&
+						    !gh[i].xrun_or_skip_count)
+							continue;
+						printf("    Gateway[%d] hot: xfer=%uKB avail=%uB xruns=%u\n",
+						       i, gh[i].total_kb_or_frames,
+						       gh[i].dma_buf_avail_bytes,
+						       gh[i].xrun_or_skip_count);
+					}
+				}
+
+				if (SOF_TEL_OFF_THD_SEC - (uint32_t)bias +
+				    sizeof(struct sof_tel_thread_section) <= t2_len) {
+					const struct sof_tel_thread_section *ts =
+						(const struct sof_tel_thread_section *)
+						(t2_buf + SOF_TEL_OFF_THD_SEC - bias);
+
+					printf("    Zephyr Threads: count=%u (dropped=%u, seq=%u)\n",
+					       ts->thread_count, ts->dropped_threads,
+					       ts->sample_seq);
+					for (i = 0; i < (int)ts->thread_count &&
+						    i < (int)SOF_TEL_MAX_THREADS; i++) {
+						const struct sof_tel_thread_info *ti = &ts->threads[i];
+						char tname[9];
+
+						memcpy(tname, ti->name, 8);
+						tname[8] = '\0';
+						printf("      Thd[%2d] %-8s id=0x%08x core=%u prio=%3d cpu=%5.1f%% stack_hwm=%5.1f%% (%4uB) kcyc=%u\n",
+						       i, tname, ti->thread_id, ti->core, ti->prio,
+						       (ti->cpu_load * 100.0) / 255.0,
+						       (ti->stack_usage * 100.0) / 255.0,
+						       (unsigned int)ti->stack_size_chunks * 64U,
+						       ti->total_exec_kcycles);
+					}
+				}
+			}
+
+			/* Check extended PMW2 window (MW3, 8 KB) */
+			if (rhdr.payload_len >= sizeof(struct sof_net_telem_snapshot) &&
+			    (sn->flags_present & SOF_TELEM_FL_PMW2_WIN3) &&
+			    sn->pmw2_win3_len >= sizeof(struct sof_tel_mw3_hdr) +
+						 SOF_TEL_MW3_HDR_OFFSET) {
+				uint32_t w3_avail = sn->pmw2_win3_len <= sizeof(sn->pmw2_win3) ?
+						    sn->pmw2_win3_len :
+						    (uint32_t)sizeof(sn->pmw2_win3);
+				const uint8_t *w3 = sn->pmw2_win3;
+				const struct sof_tel_mw3_hdr *mh =
+					(const struct sof_tel_mw3_hdr *)(w3 + SOF_TEL_MW3_HDR_OFFSET);
+
+				if (mh->magic == SOF_TEL_MW3_MAGIC) {
+					uint32_t max_comp = mh->max_comp_entries <= SOF_TEL_MW3_MAX_COMP_ITEMS ?
+							    mh->max_comp_entries : SOF_TEL_MW3_MAX_COMP_ITEMS;
+					uint32_t max_io = mh->max_io_entries <= SOF_TEL_MW3_MAX_IO_ITEMS ?
+							  mh->max_io_entries : SOF_TEL_MW3_MAX_IO_ITEMS;
+					bool has_hot = (size_t)mh->mod_hot_offset +
+						       (size_t)max_comp * sizeof(struct sof_tel_mod_hot) <= w3_avail;
+					bool has_cold = (size_t)mh->mod_cold_offset +
+							(size_t)max_comp * sizeof(struct sof_tel_mod_cold) <= w3_avail;
+					bool has_io = (size_t)mh->io_perf_offset +
+						      (size_t)max_io * sizeof(struct sof_tel_io_perf_item) <= w3_avail;
+
+					printf("  [MW3 Extended Performance & Module Resources 'PMW2' v%u (max_comp=%u, max_io=%u)]\n",
+					       mh->version, mh->max_comp_entries, mh->max_io_entries);
+					if (has_hot) {
+						const struct sof_tel_mod_hot *mhot =
+							(const struct sof_tel_mod_hot *)
+							(w3 + mh->mod_hot_offset);
+						const struct sof_tel_mod_cold *mcold = has_cold ?
+							(const struct sof_tel_mod_cold *)
+							(w3 + mh->mod_cold_offset) : NULL;
+
+						for (i = 0; i < (int)max_comp; i++) {
+							uint32_t res_id = mcold ? mcold[i].resource_id : 0;
+							uint32_t heap_u = mcold ? mcold[i].heap_usage : 0;
+							uint32_t heap_hwm = mcold ? mcold[i].heap_high_water_mark : 0;
+							uint32_t cfg_cpc = mcold ? mcold[i].configured_cpc : 0;
+
+							if (!res_id &&
+							    (size_t)(i + 1) * SOF_TEL_MW3_COMP_PERF_STRIDE <= mh->mod_hot_offset &&
+							    (size_t)(i + 1) * SOF_TEL_MW3_COMP_PERF_STRIDE <= w3_avail) {
+								const struct sof_tel_mw3_comp_perf *cp =
+									(const struct sof_tel_mw3_comp_perf *)w3;
+
+								res_id = cp[i].resource_id;
+							}
+							if ((!res_id || res_id == 0xFFFFFFFFU) &&
+							    !heap_u && !cfg_cpc &&
+							    !mhot[i].cpc_violation_count &&
+							    !mhot[i].xrun_count)
+								continue;
+							printf("    Mod[%2d] res_id=0x%08x (mod=0x%04x,inst=%u) heap=%uB hwm=%uB cpc=%u viol=%u xruns=%u\n",
+							       i, res_id,
+							       res_id & 0xFFFFU,
+							       (res_id >> 16) & 0xFFFFU,
+							       heap_u, heap_hwm, cfg_cpc,
+							       mhot[i].cpc_violation_count,
+							       mhot[i].xrun_count);
+						}
+					}
+					if (has_io) {
+						const struct sof_tel_io_perf_item *iop =
+							(const struct sof_tel_io_perf_item *)
+							(w3 + mh->io_perf_offset);
+
+						for (i = 0; i < (int)max_io; i++) {
+							if (!iop[i].resource_id && !iop[i].perf_usage)
+								continue;
+							printf("    IOPerf[%3d] res_id=0x%08x pwr_mode=%u usage=%u\n",
+							       i, iop[i].resource_id,
+							       iop[i].power_mode, iop[i].perf_usage);
+						}
+					}
+				}
+			}
 		} else {
 			fprintf(stderr, "error: TELEM_SNAPSHOT failed (%d)\n", st);
 		}

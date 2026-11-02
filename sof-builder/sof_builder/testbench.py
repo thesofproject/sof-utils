@@ -56,6 +56,9 @@ from .tplg_ipc4 import (
 SOF_NET_MAGIC = 0x534F4652  # 'SOFR'
 SOF_NET_VERSION = 1
 SOF_NET_DEFAULT_PORT = 9998
+SOF_NET_OP_FLAG_COMPRESSED = 0x8000
+SOF_NET_OP_MASK = 0x7FFF
+SOF_NET_COMP_MAGIC = 0x5A464F53  # 'SOFZ'
 
 SOF_NET_OP_PING = 0x0000
 SOF_NET_OP_GET_INFO = 0x0001
@@ -117,6 +120,10 @@ SOF_TELEM_FL_PWR_STATE_TLV = 1 << 4
 SOF_TELEM_FL_EXT_PERF_TLV = 1 << 5
 SOF_TELEM_FL_MODULES_INFO_TLV = 1 << 6
 SOF_TELEM_FL_SYS_HOST_STATS = 1 << 7
+SOF_TELEM_FL_TEL2_SLOT = 1 << 8
+SOF_TELEM_FL_PMW2_WIN3 = 1 << 9
+SOF_TELEM_FL_HOT_ONLY = 1 << 10
+SOF_TELEM_FL_COMPRESS = 1 << 14
 SOF_TELEM_FL_WAKE_DSP = 1 << 15
 SOF_TELEM_FL_ALL = (
     SOF_TELEM_FL_FW_REGS
@@ -126,7 +133,12 @@ SOF_TELEM_FL_ALL = (
     | SOF_TELEM_FL_PWR_STATE_TLV
     | SOF_TELEM_FL_EXT_PERF_TLV
     | SOF_TELEM_FL_MODULES_INFO_TLV
+    | SOF_TELEM_FL_TEL2_SLOT
+    | SOF_TELEM_FL_PMW2_WIN3
 )
+
+SOF_TEL_EXT_MAGIC = 0x324C4554  # "TEL2"
+SOF_TEL_MW3_MAGIC = 0x32574D50  # "PMW2"
 
 # PCM Control Operations (SOF_NET_OP_PCM_CTL)
 SOF_PCM_OP_STATUS = 0
@@ -184,6 +196,16 @@ WELL_KNOWN_IPC4_MODULES: Dict[int, str] = {
     0x0096: "mixout",
     0x0097: "gain",
     0x0098: "src",
+    0x1003: "peakvol",
+    0x1004: "src",
+    0x1005: "asrc",
+    0x100B: "mixin",
+    0x100C: "mixout",
+    0x1010: "eq_fir",
+    0x1011: "eq_iir",
+    0x1013: "drc",
+    0x1014: "tdfb",
+    0x1015: "multiband_drc",
 }
 
 
@@ -215,6 +237,7 @@ class CoreTelemetry:
     ll_peak_exec_us: float = 0.0
     dp_run_count: int = 0
     dp_active_threads: int = 0
+    dp_deadline_misses: int = 0
     dp_avg_cycles: int = 0
     dp_peak_cycles: int = 0
     dp_total_cycles: int = 0
@@ -470,6 +493,19 @@ class TestbenchTelemetry:
     probes: List[Dict[str, Any]] = field(default_factory=list)
     loaded_modules: Dict[int, str] = field(default_factory=dict)
     fw_error_logs: List[Dict[str, Any]] = field(default_factory=list)
+    # Extended TEL2 (MW2 Slot 1) & PMW2 (MW3) telemetry
+    tel2_present: bool = False
+    tel2_seq: int = 0
+    tel2_timestamp_us: int = 0
+    tel2_total_xruns: int = 0
+    tel2_heaps: List[Dict[str, Any]] = field(default_factory=list)
+    tel2_vregions: List[Dict[str, Any]] = field(default_factory=list)
+    tel2_gateways: List[Dict[str, Any]] = field(default_factory=list)
+    tel2_threads: List[Dict[str, Any]] = field(default_factory=list)
+    pmw2_present: bool = False
+    pmw2_io_perf: List[Dict[str, Any]] = field(default_factory=list)
+    wire_bytes: int = 0
+    raw_bytes: int = 0
     # Shell outputs
     shell_info: str = ""
     shell_pipelines: str = ""
@@ -488,6 +524,7 @@ class TestbenchTelemetry:
         lines = [
             f"=== SOFR Network Protocol Telemetry (127.0.0.1:{self.server_port}) ===",
             f"Platform: {self.platform}  |  FW: v{self.fw_version} ({self.fw_filename})  |  State: {pwr}",
+            f"Wire Payload: {self.wire_bytes} B / {self.raw_bytes} B raw ({(100.0 * (1.0 - self.wire_bytes / max(1, self.raw_bytes))):.1f}% saved)",
             f"DSP Cores: mask=0x{self.enabled_cores_mask:02x}/{self.num_cores}  |  Total LL Ticks: {self.total_ll_ticks}  |  Active PCMs: {self.active_pcm_streams}",
             f"Workload Sim: {sim_modes.get(self.workload_sim_mode, 'OFF')}  |  Mem Domain: {mem_dom} (DRAM {self.dram_factor_x100 / 100.0:.2f}x +{self.dram_cycles_per_word} cyc/w)  |  Overrides: {self.num_workload_overrides}",
             f"DAPM Graph: {self.dapm_powered_nodes}/{self.dapm_total_nodes} widgets powered, {self.dapm_active_edges}/{self.dapm_total_edges} routes active",
@@ -521,6 +558,28 @@ class TestbenchTelemetry:
                     f"  [{comp.domain} C{comp.core_id} {comp.mem_domain}] {label:<30} avg={comp.avg_kcps:5d} kcps  "
                     f"peak={comp.peak_kcps:5d} kcps  iters={comp.iterations:4d}  cyc={comp.total_cycles}{cpc_str}{lvl_str}{heap_str}"
                 )
+        if self.tel2_present:
+            lines.append(
+                f"--- Extended Memory Window 2 ('TEL2' seq={self.tel2_seq}, ts={self.tel2_timestamp_us} us, xruns={self.tel2_total_xruns}) ---"
+            )
+            for hp in self.tel2_heaps:
+                lines.append(
+                    f"  Heap[{hp['index']}] {hp['type']:<8} alloc={hp['allocated_bytes']}B  free={hp['free_bytes']}B  "
+                    f"peak={hp['max_allocated_bytes']}B  total={hp['total_bytes']}B  fails={hp['alloc_fail_count']}"
+                )
+            for gw in self.tel2_gateways:
+                lines.append(
+                    f"  Gateway {gw['type']}[{gw['index']}] {gw['direction']:<8} comp=0x{gw['comp_id']:04x}  "
+                    f"period={gw['period_bytes']}B  buf={gw['dma_buf_size']}B  xfer={gw['total_kb']}KB  "
+                    f"avail={gw['dma_buf_avail_bytes']}B  xruns={gw['xrun_count']}"
+                )
+            if self.tel2_threads:
+                lines.append(f"  Zephyr Threads ({len(self.tel2_threads)}):")
+                for th in self.tel2_threads[:8]:
+                    lines.append(
+                        f"    {th['name']:<8} (0x{th['thread_id']:08x}) C{th['core']} prio={th['prio']:3d}  "
+                        f"cpu={th['cpu_load_pct']:5.1f}%  stack_hwm={th['stack_usage_pct']:5.1f}% ({th['stack_size_bytes']}B)"
+                    )
         if self.kcontrols:
             lines.append(f"--- Topology Kcontrols ({len(self.kcontrols)}) ---")
             for kc in self.kcontrols[:12]:
@@ -572,6 +631,9 @@ class TestbenchRemoteClient:
         self._rpc_lock = threading.RLock()
         self.req_id: int = 1
         self.protocol_log: List[str] = []
+        self.last_wire_bytes: int = 0
+        self.last_raw_bytes: int = 0
+        self._no_compress: bool = False
         self.cached_modules: Dict[int, str] = dict(WELL_KNOWN_IPC4_MODULES)
         # Metadata populated when pipelines/modules are created purely via IPC4 (no -t topology loaded on server)
         self.ipc_widget_map: Dict[int, Tuple[str, int]] = {}  # comp_id -> (widget_name, pipeline_id)
@@ -582,11 +644,38 @@ class TestbenchRemoteClient:
         self.protocol_log.append(msg)
         debug_log_line("SOFR", msg)
 
+    @staticmethod
+    def _resolve_ssh_host(host: str) -> str:
+        try:
+            socket.getaddrinfo(host, None)
+            return host
+        except Exception:
+            pass
+        ssh_cfg = os.path.expanduser("~/.ssh/config")
+        if not os.path.isfile(ssh_cfg):
+            return host
+        try:
+            in_match = False
+            with open(ssh_cfg, "r", encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0].lower() == "host":
+                        in_match = host in parts[1:]
+                    elif in_match and len(parts) >= 2 and parts[0].lower() == "hostname":
+                        return parts[1]
+        except Exception:
+            pass
+        return host
+
     def connect(self) -> bool:
         with self._rpc_lock:
             self.close()
             try:
-                s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+                target_host = self._resolve_ssh_host(self.host)
+                s = socket.create_connection((target_host, self.port), timeout=self.timeout)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.settimeout(self.timeout)
                 self.sock = s
@@ -615,17 +704,74 @@ class TestbenchRemoteClient:
             buf.extend(chunk)
         return bytes(buf)
 
+    @staticmethod
+    def _sofz_decompress(src: bytes) -> bytes:
+        if len(src) < 8:
+            raise ValueError("Truncated SOFZ header")
+        magic, raw_size = struct.unpack_from("<II", src, 0)
+        if magic != SOF_NET_COMP_MAGIC or raw_size > 16 * 1024 * 1024:
+            raise ValueError(f"Invalid SOFZ header magic=0x{magic:08x} size={raw_size}")
+        dst = bytearray(raw_size)
+        in_pos = 8
+        out_pos = 0
+        src_len = len(src)
+        while in_pos < src_len and out_pos < raw_size:
+            tok = src[in_pos]
+            in_pos += 1
+            tag = tok >> 6
+            if tag == 0:
+                zlen = tok
+                if zlen == 0:
+                    if in_pos + 2 > src_len:
+                        raise ValueError("Truncated SOFZ zero run")
+                    zlen = src[in_pos] | (src[in_pos + 1] << 8)
+                    in_pos += 2
+                if zlen == 0 or out_pos + zlen > raw_size:
+                    raise ValueError("Invalid SOFZ zero run length")
+                out_pos += zlen
+            elif tag == 1:
+                llen = (tok & 0x3F) + 1
+                if in_pos + llen > src_len or out_pos + llen > raw_size:
+                    raise ValueError("Invalid SOFZ literal run")
+                dst[out_pos : out_pos + llen] = src[in_pos : in_pos + llen]
+                in_pos += llen
+                out_pos += llen
+            elif tag == 2:
+                rlen = (tok & 0x3F) + 3
+                if in_pos + 1 > src_len or out_pos + rlen > raw_size:
+                    raise ValueError("Invalid SOFZ repeat run")
+                val = src[in_pos]
+                in_pos += 1
+                dst[out_pos : out_pos + rlen] = bytes([val]) * rlen
+                out_pos += rlen
+            else:
+                mlen = (tok & 0x3F) + 4
+                if in_pos + 2 > src_len:
+                    raise ValueError("Truncated SOFZ backref")
+                dist = src[in_pos] | (src[in_pos + 1] << 8)
+                in_pos += 2
+                if dist == 0 or dist > out_pos or out_pos + mlen > raw_size:
+                    raise ValueError("Invalid SOFZ backref offset")
+                mpos = out_pos - dist
+                for k in range(mlen):
+                    dst[out_pos + k] = dst[mpos + k]
+                out_pos += mlen
+        if out_pos != raw_size:
+            raise ValueError(f"SOFZ size mismatch {out_pos} != {raw_size}")
+        return bytes(dst)
+
     def rpc(self, opcode: int, payload: bytes = b"") -> Tuple[int, bytes]:
         with self._rpc_lock:
             if self.sock is None and not self.connect():
                 return (-107, b"")
             rid = self.req_id
             self.req_id += 1
+            wire_op = opcode if self._no_compress else (opcode | SOF_NET_OP_FLAG_COMPRESSED)
             hdr = struct.pack(
                 "<IHHIIi",
                 SOF_NET_MAGIC,
                 SOF_NET_VERSION,
-                opcode,
+                wire_op,
                 rid,
                 len(payload),
                 0,
@@ -637,7 +783,14 @@ class TestbenchRemoteClient:
                 magic, ver, rop, rrid, plen, status = struct.unpack("<IHHIIi", rhdr)
                 if magic != SOF_NET_MAGIC or ver != SOF_NET_VERSION:
                     raise ConnectionError(f"Invalid SOFR header magic=0x{magic:08x} ver={ver}")
+                if status == -38 and not self._no_compress and plen == 0:
+                    self._no_compress = True
+                    return self.rpc(opcode, payload)
                 rdata = self._recv_exact(plen) if plen > 0 else b""
+                self.last_wire_bytes = plen
+                if (rop & SOF_NET_OP_FLAG_COMPRESSED) and plen >= 8:
+                    rdata = self._sofz_decompress(rdata)
+                self.last_raw_bytes = len(rdata)
                 return (status, rdata)
             except Exception:
                 self.close()
@@ -1223,7 +1376,7 @@ class TestbenchRemoteClient:
         slot_type: int = 0,
     ) -> Tuple[int, bytes]:
         """Read bytes from an emulated DSP SRAM window (`SOF_NET_OP_WIN_READ` 0x0021)."""
-        req_sz = max(16, min(4096, size))
+        req_sz = max(16, min(65536, size))
         req = struct.pack("<6I", win_id, slot_type, 0, offset, req_sz, 0)
         st, rdata = self.rpc(SOF_NET_OP_WIN_READ, req)
         self._log(f"[SOFR] OP_WIN_READ (win={win_id} off={offset} sz={req_sz}) -> status={st} ({len(rdata)}B)")
@@ -1272,14 +1425,33 @@ class TestbenchRemoteClient:
         )
         return (st, {}, b"")
 
-    def get_telemetry_snapshot(self, query_mask: int = SOF_TELEM_FL_ALL) -> Optional[TestbenchTelemetry]:
-        req = struct.pack("<II", query_mask, 0)
+    def get_telemetry_snapshot(
+        self,
+        query_mask: int = SOF_TELEM_FL_ALL,
+        flags: int = SOF_TELEM_FL_WAKE_DSP | SOF_TELEM_FL_COMPRESS,
+        hot_only: bool = False,
+    ) -> Optional[TestbenchTelemetry]:
+        if hot_only:
+            query_mask &= ~(
+                SOF_TELEM_FL_MEM_STATE_TLV
+                | SOF_TELEM_FL_PWR_STATE_TLV
+                | SOF_TELEM_FL_EXT_PERF_TLV
+                | SOF_TELEM_FL_MODULES_INFO_TLV
+            )
+            query_mask |= SOF_TELEM_FL_HOT_ONLY
+            flags |= SOF_TELEM_FL_HOT_ONLY
+        req = struct.pack("<II", query_mask, flags)
         st, raw_snap = self.rpc(SOF_NET_OP_TELEM_SNAPSHOT, req)
         cdev_info_sz = 716
         if st != 0 or len(raw_snap) < cdev_info_sz + 8:
             return None
 
-        telem = TestbenchTelemetry(connected=True, server_port=self.port)
+        telem = TestbenchTelemetry(
+            connected=True,
+            server_port=self.port,
+            wire_bytes=self.last_wire_bytes,
+            raw_bytes=self.last_raw_bytes,
+        )
         (
             _abi_ver,
             ipc_type,
@@ -1337,6 +1509,32 @@ class TestbenchRemoteClient:
         (mod_info_len,) = struct.unpack_from("<I", raw_snap, off)
         off += 4
         mod_info_tlv = raw_snap[off : off + min(4096, mod_info_len)]
+        off += 4096
+
+        tel2_slot = b""
+        pmw2_win3 = b""
+        if len(raw_snap) >= off + 4 + 4096 + 4 + 8192:
+            (tel2_len,) = struct.unpack_from("<I", raw_snap, off)
+            off += 4
+            tel2_slot = raw_snap[off : off + min(4096, tel2_len)]
+            off += 4096
+            (pmw2_len,) = struct.unpack_from("<I", raw_snap, off)
+            off += 4
+            if pmw2_len > 0:
+                pmw2_win3 = raw_snap[off : off + min(8192, pmw2_len)]
+                if not any(perf_win3) and len(pmw2_win3) >= 88 * 48:
+                    buf3 = bytearray(4096)
+                    for mi in range(88):
+                        rid, rflg, pk, av, iters, cyc = struct.unpack_from(
+                            "<IIIIIQ", pmw2_win3, mi * 48
+                        )
+                        lflg = (rflg & 1) | (((rflg >> 31) & 1) << 1)
+                        iters64 = (((rflg >> 1) & 0x3FFFFFFF) << 32) | iters
+                        struct.pack_into(
+                            "<IIIIQQ", buf3, mi * 32, rid, lflg, pk, av, iters64, cyc
+                        )
+                    perf_win3 = bytes(buf3)
+            off += 8192
 
         # 1. Modules Info TLV
         if (flags_present & SOF_TELEM_FL_MODULES_INFO_TLV) and len(mod_info_tlv) >= 4:
@@ -1465,17 +1663,33 @@ class TestbenchRemoteClient:
                         total_cycles=cycles,
                     )
                 )
-        elif flags_present & SOF_TELEM_FL_PERF_WIN3:
+        elif flags_present & (SOF_TELEM_FL_PERF_WIN3 | SOF_TELEM_FL_PMW2_WIN3):
             off3 = 0
-            while off3 + 32 <= len(perf_win3):
-                res_id, cflags, peak_kcps, avg_kcps, iters, cycles = struct.unpack_from(
-                    "<IIIIQQ", perf_win3, off3
-                )
-                off3 += 32
-                if res_id in (0, 0xFFFFFFFF):
-                    break
+            use_48b = (
+                not any(perf_win3)
+                and len(pmw2_win3) >= 0x1FC0 + 4
+                and struct.unpack_from("<I", pmw2_win3, 0x1FC0)[0] == SOF_TEL_MW3_MAGIC
+            )
+            w3_src = pmw2_win3[: min(len(pmw2_win3), 0x1080)] if use_48b else perf_win3
+            stride3 = 48 if use_48b else 32
+            while off3 + stride3 <= len(w3_src):
+                if use_48b:
+                    res_id, raw_flags, peak_kcps, avg_kcps, iters, cycles = struct.unpack_from(
+                        "<IIIIIQ", w3_src, off3
+                    )
+                    cflags = (raw_flags & 1) | (((raw_flags >> 31) & 1) << 1)
+                    iters = (((raw_flags >> 1) & 0x3FFFFFFF) << 32) | iters
+                else:
+                    res_id, cflags, peak_kcps, avg_kcps, iters, cycles = struct.unpack_from(
+                        "<IIIIQQ", w3_src, off3
+                    )
+                off3 += stride3
+                if (res_id == 0 and peak_kcps == 0 and avg_kcps == 0 and iters == 0) or res_id == 0xFFFFFFFF:
+                    continue
                 mod_id = res_id & 0xFFFF
                 inst_id = (res_id >> 16) & 0xFFFF
+                if mod_id == 0:
+                    continue
                 mname = self.cached_modules.get(mod_id, f"mod_0x{mod_id:02x}")
                 comp_items.append(
                     ComponentPerfItem(
@@ -1492,9 +1706,242 @@ class TestbenchRemoteClient:
                     )
                 )
         telem.components = comp_items
+
+        # 7. Extended MW2 Slot 1 ('TEL2') decoding (supports both canonical 0x100 and debugfs -4B 0x0FC)
+        t2_buf = tel2_slot if len(tel2_slot) >= 512 else telem_slot
+        bias = -1
+        if len(t2_buf) >= 0x0100 + 64 and struct.unpack_from("<I", t2_buf, 0x0100)[0] == SOF_TEL_EXT_MAGIC:
+            bias = 0
+        elif len(t2_buf) >= 0x00FC + 64 and struct.unpack_from("<I", t2_buf, 0x00FC)[0] == SOF_TEL_EXT_MAGIC:
+            bias = 4
+
+        if bias >= 0:
+            _m, _ver, _mc, _nsecs, seq, ts_us = struct.unpack_from("<IBBHII", t2_buf, 0x0100 - bias)
+            telem.tel2_present = True
+            telem.tel2_seq = seq
+            telem.tel2_timestamp_us = ts_us
+
+            # Hot line 0 (0x0140)
+            if len(t2_buf) >= 0x0140 - bias + 64:
+                hot_vals = struct.unpack_from("<5H5H5HH16H", t2_buf, 0x0140 - bias)
+                ll_overruns = hot_vals[0:5]
+                dp_misses = hot_vals[5:10]
+                active_ll = hot_vals[10:15]
+                telem.tel2_total_xruns = hot_vals[15]
+                ppl_xruns = hot_vals[16:32]
+                for c_idx, ct in enumerate(telem.cores):
+                    if c_idx < 5:
+                        ct.ll_deadline_violations = ll_overruns[c_idx]
+                        ct.ll_active_tasks = active_ll[c_idx]
+                        ct.dp_deadline_misses = dp_misses[c_idx]
+            else:
+                ppl_xruns = (0,) * 16
+
+            # Memory & Heaps section (0x0240)
+            if len(t2_buf) >= 0x0240 - bias + 256:
+                hp_free, hp_tot, lp_free, lp_tot, ebb_lo, ebb_hi, _lpebb, _r = struct.unpack_from(
+                    "<HHHHIIII", t2_buf, 0x0240 - bias
+                )
+                if hp_tot > 0 and telem.hpsram.total_banks == 0:
+                    telem.hpsram.total_banks = (hp_tot + 15) // 16
+                    telem.hpsram.free_phys_pages = hp_free
+                    telem.hpsram.powered_banks = bin(ebb_lo).count("1") + bin(ebb_hi).count("1")
+                heap_names = {1: "SYS", 2: "SHARED", 3: "LL_USER", 4: "L3_IMR", 5: "DRV_USER"}
+                tot_alloc = 0
+                for hi in range(6):
+                    htype, hfail, htot, halloc, hfree, hmax = struct.unpack_from(
+                        "<HHIIII", t2_buf, 0x0240 - bias + 24 + hi * 20
+                    )
+                    if htype == 0 and htot == 0:
+                        continue
+                    tot_alloc += halloc
+                    telem.tel2_heaps.append(
+                        {
+                            "index": hi,
+                            "type": heap_names.get(htype, f"TYPE_{htype}"),
+                            "alloc_fail_count": hfail,
+                            "total_bytes": htot,
+                            "allocated_bytes": halloc,
+                            "free_bytes": hfree,
+                            "max_allocated_bytes": hmax,
+                        }
+                    )
+                if tot_alloc > 0 and telem.total_heap_bytes == 0:
+                    telem.total_heap_bytes = tot_alloc
+
+            # Vregion section (0x0340)
+            if len(t2_buf) >= 0x0340 - bias + 512:
+                v_tot, v_free, v_min, _velems_use, v_fails, v_base = struct.unpack_from(
+                    "<HHHHII", t2_buf, 0x0340 - bias
+                )
+                v_act, v_created = struct.unpack_from("<HH", t2_buf, 0x0340 - bias + 80)
+                for vi in range(min(v_act, 16)):
+                    vba, vpg, vuc, vtf, vsz, vused, via, vif, vfc = struct.unpack_from(
+                        "<IHBBIIIHH", t2_buf, 0x0340 - bias + 128 + vi * 24
+                    )
+                    telem.tel2_vregions.append(
+                        {
+                            "base_va": vba,
+                            "total_pages": vpg,
+                            "use_count": vuc,
+                            "type_and_flags": vtf,
+                            "lifetime_size_bytes": vsz,
+                            "lifetime_used_bytes": vused,
+                            "interim_alloc_bytes": via,
+                            "interim_free_kb": vif,
+                            "lifetime_free_count": vfc,
+                            "pool_total_pages": v_tot,
+                            "pool_free_pages": v_free,
+                            "pool_min_free_pages": v_min,
+                            "pool_alloc_fails": v_fails,
+                            "pool_base_va": v_base,
+                            "total_created": v_created,
+                        }
+                    )
+
+            # Pipelines section (0x0540)
+            if len(t2_buf) >= 0x0540 - bias + 384:
+                for c_idx, ct in enumerate(telem.cores):
+                    if c_idx < 5:
+                        _cid, _llt, dpt, _ap, _kb, _r = struct.unpack_from(
+                            "<BBBBII", t2_buf, 0x0540 - bias + c_idx * 12
+                        )
+                        ct.dp_active_threads = dpt
+                act_ppls, _tot_comps = struct.unpack_from("<HH", t2_buf, 0x0540 - bias + 60)
+                if not telem.pipelines:
+                    for pi in range(min(act_ppls, 16)):
+                        pid, pcore, pprio, _pstat, pcomps, _pattr, pper, _psched, _pxb = struct.unpack_from(
+                            "<HBBBBHIIi", t2_buf, 0x0540 - bias + 64 + pi * 20
+                        )
+                        telem.pipelines.append(
+                            PipelineSchedTelemetry(
+                                pipeline_id=pid,
+                                core_id=pcore,
+                                priority=pprio,
+                                period_us=pper or 1000,
+                                num_ll_modules=pcomps,
+                                xrun_count=ppl_xruns[pi] if pi < len(ppl_xruns) else 0,
+                            )
+                        )
+
+            # DAIs & Gateways section (0x06C0 + 0x0180)
+            if len(t2_buf) >= 0x06C0 - bias + 256 and len(t2_buf) >= 0x0180 - bias + 128:
+                gw_types = {1: "SSP", 2: "DMIC", 3: "ALH", 4: "HDA", 5: "HOST_DMA", 6: "OTHER"}
+                for gi in range(16):
+                    gt, gidx, gdir, gch, gcid, gst, ggrp, gper, gbuf = struct.unpack_from(
+                        "<BBBbHBBII", t2_buf, 0x06C0 - bias + gi * 16
+                    )
+                    if gt == 0:
+                        continue
+                    g_kb, g_avail, g_xr = struct.unpack_from("<IHH", t2_buf, 0x0180 - bias + gi * 8)
+                    telem.tel2_gateways.append(
+                        {
+                            "type": gw_types.get(gt, f"GW_{gt}"),
+                            "index": gidx,
+                            "direction": "CAPTURE" if gdir else "PLAYBACK",
+                            "dma_chan": gch,
+                            "comp_id": gcid,
+                            "state": gst,
+                            "group_id": ggrp,
+                            "period_bytes": gper,
+                            "dma_buf_size": gbuf,
+                            "total_kb": g_kb,
+                            "dma_buf_avail_bytes": g_avail,
+                            "xrun_count": g_xr,
+                        }
+                    )
+            elif len(t2_buf) >= 0x0180 - bias + 128:
+                for gi in range(16):
+                    g_kb, g_avail, g_xr = struct.unpack_from("<IHH", t2_buf, 0x0180 - bias + gi * 8)
+                    if g_kb == 0 and g_avail == 0 and g_xr == 0:
+                        continue
+                    telem.tel2_gateways.append(
+                        {
+                            "type": "HOT",
+                            "index": gi,
+                            "direction": "",
+                            "dma_chan": -1,
+                            "comp_id": 0,
+                            "state": 0,
+                            "group_id": 0,
+                            "period_bytes": 0,
+                            "dma_buf_size": 0,
+                            "total_kb": g_kb,
+                            "dma_buf_avail_bytes": g_avail,
+                            "xrun_count": g_xr,
+                        }
+                    )
+
+            # Zephyr Threads section (0x07C0)
+            if len(t2_buf) >= 0x07C0 - bias + 832:
+                t_cnt, t_drop, t_seq = struct.unpack_from("<HHI", t2_buf, 0x07C0 - bias + 8)
+                for ti in range(min(t_cnt, 32)):
+                    tid, tcore, tprio, tst, tcpu, tstk, tflg, tchk, tkcyc, tn_raw = struct.unpack_from(
+                        "<IBbBBBBHI8s", t2_buf, 0x07C0 - bias + 32 + ti * 24
+                    )
+                    telem.tel2_threads.append(
+                        {
+                            "thread_id": tid,
+                            "name": tn_raw.split(b"\x00", 1)[0].decode("ascii", errors="replace"),
+                            "core": tcore,
+                            "prio": tprio,
+                            "state": tst,
+                            "cpu_load_pct": round((tcpu * 100.0) / 255.0, 2),
+                            "stack_usage_pct": round((tstk * 100.0) / 255.0, 2),
+                            "stack_size_bytes": tchk * 64,
+                            "flags": tflg,
+                            "total_exec_kcycles": tkcyc,
+                            "dropped_threads": t_drop,
+                            "sample_seq": t_seq,
+                        }
+                    )
+
+        # 8. Extended MW3 ('PMW2') decoding
+        if len(pmw2_win3) >= 0x1FC0 + 64:
+            m_mag, _mver, max_comp, max_io, hot_off, cold_off, io_off = struct.unpack_from(
+                "<IHHHHHH", pmw2_win3, 0x1FC0
+            )
+            if m_mag == SOF_TEL_MW3_MAGIC:
+                telem.pmw2_present = True
+                mod_res_map: Dict[int, Tuple[int, int, int, int, int]] = {}
+                for mi in range(min(max_comp, 88)):
+                    if hot_off + (mi + 1) * 4 > len(pmw2_win3):
+                        break
+                    cviol, cxrun = struct.unpack_from("<HH", pmw2_win3, hot_off + mi * 4)
+                    rid, husage, hhwm, ccpc = 0, 0, 0, 0
+                    if cold_off + (mi + 1) * 16 <= len(pmw2_win3):
+                        rid, husage, hhwm, ccpc = struct.unpack_from("<IIII", pmw2_win3, cold_off + mi * 16)
+                    if rid in (0, 0xFFFFFFFF) and (mi + 1) * 48 <= hot_off and (mi + 1) * 48 <= len(pmw2_win3):
+                        (rid,) = struct.unpack_from("<I", pmw2_win3, mi * 48)
+                    if rid in (0, 0xFFFFFFFF) and mi < len(telem.components):
+                        rid = telem.components[mi].resource_id
+                    if rid not in (0, 0xFFFFFFFF):
+                        mod_res_map[rid] = (husage, hhwm, ccpc, cviol, cxrun)
+                for comp in telem.components:
+                    if comp.resource_id in mod_res_map:
+                        husage, _hhwm, ccpc, cviol, cxrun = mod_res_map[comp.resource_id]
+                        if comp.heap_bytes == 0:
+                            comp.heap_bytes = husage
+                        if comp.effective_cpc == 0:
+                            comp.effective_cpc = ccpc
+                        comp.cpc_violations = max(comp.cpc_violations, cviol)
+                        comp.error_count = max(comp.error_count, cxrun)
+                for ioi in range(min(max_io, 128)):
+                    if io_off + (ioi + 1) * 12 <= len(pmw2_win3):
+                        iorid, iopm, iousage = struct.unpack_from("<III", pmw2_win3, io_off + ioi * 12)
+                        if iorid not in (0, 0xFFFFFFFF) or iousage > 0:
+                            telem.pmw2_io_perf.append(
+                                {
+                                    "resource_id": iorid,
+                                    "power_mode": iopm,
+                                    "perf_usage": iousage,
+                                }
+                            )
+
         self._log(
             f"[SOFR] OP_TELEM_SNAPSHOT -> ticks={telem.total_ll_ticks} "
-            f"cores={len(telem.cores)} components={len(telem.components)}"
+            f"cores={len(telem.cores)} components={len(telem.components)} "
+            f"tel2={telem.tel2_present} pmw2={telem.pmw2_present}"
         )
         return telem
 

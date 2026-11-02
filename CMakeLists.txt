@@ -6,3 +6,6 @@ project(SOF_UTILS C ASM)
 
 enable_testing()
 add_subdirectory(sof-testbench)
+if(NOT TESTBENCH_XTENSA_SIM)
+	add_subdirectory(sof-remote-server)
+endif()
