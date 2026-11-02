@@ -95,6 +95,7 @@ static volatile bool g_quit_requested;
 static volatile bool g_dsp_paused;
 static volatile int g_step_ticks_remaining;
 static __thread bool g_in_remote_rpc;
+static __thread bool g_client_accepts_compressed;
 static uint32_t g_perf_meas_state = 2; /* 2 = STARTED by default */
 
 /* Per-core telemetry state */
@@ -105,7 +106,8 @@ static uint64_t g_total_ticks;
 static uint8_t g_win0_fw_regs[4096];
 static uint8_t g_win1_outbox[4096];
 static uint8_t g_win2_debug[65536];
-static uint8_t g_win3_perf[4096];
+static uint8_t g_win3_perf[8192];
+static uint8_t g_win3_legacy[4096];
 static char g_last_shell_output[4096];
 static uint32_t g_shell_seq;
 
@@ -188,14 +190,36 @@ static int write_exact(int fd, const void *buf, size_t len)
 static int send_reply(int sock, uint16_t opcode, uint32_t req_id,
 		      int32_t status, const void *payload, uint32_t payload_len)
 {
+	uint16_t base_op = (uint16_t)(opcode & SOF_NET_OP_MASK);
 	struct sof_net_hdr hdr = {
 		.magic       = SOF_NET_MAGIC,
 		.version     = SOF_NET_VERSION,
-		.opcode      = opcode,
+		.opcode      = base_op,
 		.req_id      = req_id,
 		.payload_len = payload ? payload_len : 0,
 		.status      = status,
 	};
+
+	if (g_client_accepts_compressed && payload && payload_len >= 128U) {
+		uint8_t *cbuf = malloc(payload_len);
+
+		if (cbuf) {
+			uint32_t clen = sof_net_compress((const uint8_t *)payload,
+							 payload_len, cbuf, payload_len);
+			if (clen > 0 && clen < payload_len) {
+				int rc;
+
+				hdr.opcode = (uint16_t)(base_op | SOF_NET_OP_FLAG_COMPRESSED);
+				hdr.payload_len = clen;
+				rc = write_exact(sock, &hdr, sizeof(hdr));
+				if (rc == 0)
+					rc = write_exact(sock, cbuf, clen);
+				free(cbuf);
+				return rc;
+			}
+			free(cbuf);
+		}
+	}
 
 	if (write_exact(sock, &hdr, sizeof(hdr)) < 0)
 		return -1;
@@ -812,16 +836,30 @@ static uint32_t build_ext_perf_tlv(struct testbench_prm *tp, uint8_t *out, uint3
 	uint32_t count = 0;
 	uint32_t max_items = (cap > 4) ? ((cap - 4) / sizeof(struct perf_data_item_comp_wire)) : 0;
 	struct perf_data_item_comp_wire *items = (struct perf_data_item_comp_wire *)(out + 4);
-	struct perf_data_item_comp_wire *win3_items = (struct perf_data_item_comp_wire *)g_win3_perf;
+	struct perf_data_item_comp_wire *legacy_items =
+		(struct perf_data_item_comp_wire *)g_win3_legacy;
+	struct sof_tel_mw3_comp_perf *win3_items = (struct sof_tel_mw3_comp_perf *)g_win3_perf;
+	struct sof_tel_mod_hot *mod_hots =
+		(struct sof_tel_mod_hot *)(g_win3_perf + SOF_TEL_MW3_MOD_HOT_OFFSET);
+	struct sof_tel_mod_cold *mod_colds =
+		(struct sof_tel_mod_cold *)(g_win3_perf + SOF_TEL_MW3_MOD_COLD_OFFSET);
+	struct sof_tel_io_perf_item *io_items =
+		(struct sof_tel_io_perf_item *)(g_win3_perf + SOF_TEL_MW3_IO_PERF_OFFSET);
+	struct sof_tel_mw3_hdr *mw3_hdr =
+		(struct sof_tel_mw3_hdr *)(g_win3_perf + SOF_TEL_MW3_HDR_OFFSET);
+	uint32_t legacy_count = 0;
 	uint32_t win3_count = 0;
+	uint32_t io_count = 0;
 	uint32_t enabled_mask = arch_cpu_enabled_cores();
 	int c;
 
+	(void)tp;
 	if (max_items == 0)
 		return 0;
 
 	memset(out, 0, cap);
 	memset(g_win3_perf, 0, sizeof(g_win3_perf));
+	memset(g_win3_legacy, 0, sizeof(g_win3_legacy));
 
 	/* 1. Per-core summary items (module_id == 0, instance_id == core_id) */
 	struct host_sched_telemetry *st = host_telem_get();
@@ -893,11 +931,66 @@ static uint32_t build_ext_perf_tlv(struct testbench_prm *tp, uint8_t *out, uint3
 				it->total_cycles_consumed = (uint64_t)iters * it->avg_kcps;
 			}
 
-			if ((win3_count + 1) * sizeof(*win3_items) <= sizeof(g_win3_perf))
-				win3_items[win3_count++] = *it;
+			if (legacy_count < (sizeof(g_win3_legacy) / sizeof(*legacy_items)))
+				legacy_items[legacy_count++] = *it;
+
+			if (win3_count < SOF_TEL_MW3_MAX_COMP_ITEMS) {
+				uint32_t widx = win3_count++;
+				uint32_t mod_heap = (uint32_t)sizeof(struct comp_dev);
+
+				if (icd->cd->mod) {
+					size_t hwm = 0;
+
+					module_adapter_heap_usage(icd->cd->mod, &hwm);
+					if (hwm > 0)
+						mod_heap = (uint32_t)hwm;
+				}
+
+				win3_items[widx].resource_id = it->resource_id;
+				win3_items[widx].power_mode = it->power_mode;
+				win3_items[widx].rsvd =
+					(uint32_t)((it->total_iteration_count >> 32) & 0x3FFFFFFFU);
+				win3_items[widx].is_removed = it->is_removed;
+				win3_items[widx].peak_kcps = it->peak_kcps;
+				win3_items[widx].avg_kcps = it->avg_kcps;
+				win3_items[widx].total_iteration_count =
+					(uint32_t)it->total_iteration_count;
+				win3_items[widx].total_cycles_consumed =
+					it->total_cycles_consumed;
+				mod_hots[widx].cpc_violation_count =
+					mt ? (uint16_t)(mt->cpc_violations & 0xFFFFU) : 0;
+				mod_hots[widx].xrun_count =
+					mt ? (uint16_t)(mt->error_count & 0xFFFFU) : 0;
+				mod_colds[widx].resource_id = icd->id;
+				mod_colds[widx].heap_usage = mod_heap;
+				mod_colds[widx].heap_high_water_mark = mod_heap;
+				mod_colds[widx].configured_cpc =
+					(mt && mt->effective_cpc) ? mt->effective_cpc :
+					(mt && mt->cpc ? mt->cpc : 6400U);
+
+				if (icd->cd->ipc_config.type == SOF_COMP_HOST ||
+				    icd->cd->ipc_config.type == SOF_COMP_DAI ||
+				    icd->cd->ipc_config.type == SOF_COMP_FILEREAD ||
+				    icd->cd->ipc_config.type == SOF_COMP_FILEWRITE) {
+					if (io_count < SOF_TEL_MW3_MAX_IO_ITEMS) {
+						io_items[io_count].resource_id = icd->id;
+						io_items[io_count].power_mode = it->power_mode;
+						io_items[io_count].perf_usage = it->avg_kcps;
+						io_count++;
+					}
+				}
+			}
 		}
 	}
-	(void)tp;
+
+	/* Populate PMW2 footer directory at 0x1FC0 */
+	mw3_hdr->magic = SOF_TEL_MW3_MAGIC;
+	mw3_hdr->version = SOF_TEL_MW3_VERSION;
+	mw3_hdr->max_comp_entries = SOF_TEL_MW3_MAX_COMP_ITEMS;
+	mw3_hdr->max_io_entries = SOF_TEL_MW3_MAX_IO_ITEMS;
+	mw3_hdr->mod_hot_offset = SOF_TEL_MW3_MOD_HOT_OFFSET;
+	mw3_hdr->mod_cold_offset = SOF_TEL_MW3_MOD_COLD_OFFSET;
+	mw3_hdr->io_perf_offset = SOF_TEL_MW3_IO_PERF_OFFSET;
 
 	memcpy(out, &count, sizeof(uint32_t));
 	return 4 + count * sizeof(struct perf_data_item_comp_wire);
@@ -905,6 +998,11 @@ static uint32_t build_ext_perf_tlv(struct testbench_prm *tp, uint8_t *out, uint3
 
 static void refresh_emulated_windows(struct testbench_prm *tp)
 {
+	struct host_sched_telemetry *st = host_telem_get();
+	struct ipc *ipc = sof_get() ? sof_get()->ipc : NULL;
+	struct list_item *clist;
+	int c, i;
+
 	/* Window 0: FW Regs */
 	uint32_t *r32 = (uint32_t *)g_win0_fw_regs;
 
@@ -914,14 +1012,347 @@ static void refresh_emulated_windows(struct testbench_prm *tp)
 	r32[3] = 0x00000000U; /* lnec */
 	r32[4] = (uint32_t)g_total_ticks; /* ltr */
 
-	/* Window 2 Slot 0 (offset 4096): Telemetry Slot */
+	/* Window 2 Slot 1 (offset 4096): Full 4,096 B TEL2 Telemetry Slot */
 	uint8_t *tslot = g_win2_debug + 4096;
 	uint32_t sep = 0x0000C0DEU;
 
+	memset(tslot, 0, 4096);
 	memcpy(tslot, &sep, 4);
-	memcpy(tslot + 4, g_core_ticks, sizeof(g_core_ticks));
+	for (c = 0; c < (int)SOF_TEL_MAX_CORES && c < CONFIG_CORE_COUNT; c++) {
+		memcpy(tslot + 4 + c * 40, &g_core_ticks[c],
+		       sizeof(g_core_ticks[0]));
+	}
 
-	/* Window 3: Perf window */
+	struct sof_tel_ext_hdr *ehdr =
+		(struct sof_tel_ext_hdr *)(tslot + SOF_TEL_EXT_HDR_OFFSET);
+	struct sof_tel_hot_line0 *hot0 =
+		(struct sof_tel_hot_line0 *)(tslot + SOF_TEL_OFF_HOT_LINE0);
+	struct sof_tel_gw_hot *gw_hot =
+		(struct sof_tel_gw_hot *)(tslot + SOF_TEL_OFF_GW_HOT);
+	struct sof_tel_mem_section *mem_sec =
+		(struct sof_tel_mem_section *)(tslot + SOF_TEL_OFF_MEM_SEC);
+	struct sof_tel_vregion_section *vreg_sec =
+		(struct sof_tel_vregion_section *)(tslot + SOF_TEL_OFF_VREG_SEC);
+	struct sof_tel_ppl_section *ppl_sec =
+		(struct sof_tel_ppl_section *)(tslot + SOF_TEL_OFF_PPL_SEC);
+	struct sof_tel_dai_section *dai_sec =
+		(struct sof_tel_dai_section *)(tslot + SOF_TEL_OFF_DAI_SEC);
+	struct sof_tel_thread_section *thd_sec =
+		(struct sof_tel_thread_section *)(tslot + SOF_TEL_OFF_THD_SEC);
+
+	/* 1. Hot Zone & Pipelines & Gateways */
+	uint16_t total_xruns = (uint16_t)(g_pcm_xruns & 0xFFFFU);
+	uint16_t ppl_cnt = 0;
+	uint16_t comp_cnt = 0;
+	uint16_t gw_cnt = 0;
+
+	for (c = 0; c < (int)SOF_TEL_MAX_CORES; c++) {
+		ppl_sec->core_sched[c].core_id = (uint8_t)c;
+		if (st && c < TB_TELEM_MAX_CORES && st->cores[c].active) {
+			hot0->ll_overrun_count[c] =
+				(uint16_t)(st->cores[c].ll_deadline_violations & 0xFFFFU);
+			hot0->dp_deadline_misses[c] = 0;
+			hot0->active_ll_tasks[c] =
+				(uint16_t)(st->cores[c].ll_active_tasks & 0xFFFFU);
+			ppl_sec->core_sched[c].ll_task_count =
+				(uint8_t)(st->cores[c].ll_active_tasks & 0xFFU);
+			ppl_sec->core_sched[c].dp_task_count =
+				(uint8_t)(st->cores[c].dp_active_threads & 0xFFU);
+			ppl_sec->core_sched[c].active_kcps_budget =
+				st->cores[c].ll_avg_kcps + st->cores[c].dp_avg_kcps;
+		}
+	}
+
+	if (ipc) {
+		list_for_item(clist, &ipc->comp_list) {
+			struct ipc_comp_dev *icd = container_of(clist, struct ipc_comp_dev, list);
+
+			if (icd->type == COMP_TYPE_COMPONENT && icd->cd) {
+				comp_cnt++;
+				if (icd->cd->ipc_config.type == SOF_COMP_HOST ||
+				    icd->cd->ipc_config.type == SOF_COMP_DAI ||
+				    icd->cd->ipc_config.type == SOF_COMP_FILEREAD ||
+				    icd->cd->ipc_config.type == SOF_COMP_FILEWRITE) {
+					if (gw_cnt < SOF_TEL_MAX_GATEWAYS) {
+						uint16_t gi = gw_cnt++;
+						struct sof_tel_gw_cold *gc = &dai_sec->gateways[gi];
+						struct host_mod_telem *mt = NULL;
+						uint32_t mi;
+
+						if (st) {
+							for (mi = 0; mi < st->num_mods; mi++) {
+								if (st->mods[mi].active &&
+								    st->mods[mi].comp_id == icd->id) {
+									mt = &st->mods[mi];
+									break;
+								}
+							}
+						}
+						gc->gw_type = (icd->cd->ipc_config.type ==
+							       SOF_COMP_DAI) ?
+							      SOF_TEL_GW_ALH : SOF_TEL_GW_HOST_DMA;
+						gc->index = (uint8_t)gi;
+						gc->direction = (uint8_t)(icd->cd->direction & 1);
+						gc->dma_chan = (int8_t)gi;
+						gc->comp_id = (uint16_t)(icd->id & 0xFFFFU);
+						gc->state = (uint8_t)icd->cd->state;
+						gc->group_id = 0;
+						gc->period_bytes = mt && mt->ibs ? mt->ibs : 384U;
+						gc->dma_buf_size = gc->period_bytes * 2U;
+
+						if (mt && mt->num_out_pins > 0) {
+							gw_hot[gi].total_kb_or_frames =
+								(uint32_t)(mt->out_pins[0].total_bytes_transferred >> 10);
+							gw_hot[gi].dma_buf_avail_bytes =
+								(uint16_t)(mt->out_pins[0].exit_avail_bytes & 0xFFFFU);
+							gw_hot[gi].xrun_or_skip_count =
+								(uint16_t)(mt->out_pins[0].xrun_count & 0xFFFFU);
+						} else if (mt && mt->num_in_pins > 0) {
+							gw_hot[gi].total_kb_or_frames =
+								(uint32_t)(mt->in_pins[0].total_bytes_transferred >> 10);
+							gw_hot[gi].dma_buf_avail_bytes =
+								(uint16_t)(mt->in_pins[0].exit_avail_bytes & 0xFFFFU);
+							gw_hot[gi].xrun_or_skip_count =
+								(uint16_t)(mt->in_pins[0].xrun_count & 0xFFFFU);
+						} else {
+							gw_hot[gi].total_kb_or_frames =
+								(uint32_t)((g_total_ticks * gc->period_bytes) >> 10);
+							gw_hot[gi].dma_buf_avail_bytes =
+								(uint16_t)gc->period_bytes;
+						}
+					}
+				}
+			} else if (icd->type == COMP_TYPE_PIPELINE && icd->pipeline) {
+				if (ppl_cnt < SOF_TEL_MAX_PIPELINES) {
+					uint16_t pi = ppl_cnt++;
+					struct sof_tel_ppl_info *pi_out = &ppl_sec->pipelines[pi];
+					uint8_t pcore = icd->core < SOF_TEL_MAX_CORES ?
+							(uint8_t)icd->core : 0;
+
+					pi_out->pipeline_id =
+						(uint16_t)icd->pipeline->pipeline_id;
+					pi_out->core = pcore;
+					pi_out->priority = (uint8_t)icd->pipeline->priority;
+					pi_out->status = (uint8_t)icd->pipeline->status;
+					pi_out->period_us = icd->pipeline->period ?
+							    icd->pipeline->period : 1000U;
+					pi_out->sched_comp_id =
+						icd->pipeline->sched_comp ?
+						dev_comp_id(icd->pipeline->sched_comp) : 0;
+					ppl_sec->core_sched[pcore].active_ppl_count++;
+				}
+			}
+		}
+	}
+
+	if (st) {
+		for (i = 0; i < (int)st->num_pipes && i < TB_TELEM_MAX_PIPES; i++) {
+			uint16_t pxr;
+			int pi;
+
+			if (!st->pipes[i].active)
+				continue;
+			pxr = (uint16_t)(st->pipes[i].xrun_count & 0xFFFFU);
+			total_xruns += pxr;
+			for (pi = 0; pi < (int)ppl_cnt; pi++) {
+				if (ppl_sec->pipelines[pi].pipeline_id ==
+				    (uint16_t)st->pipes[i].pipeline_id) {
+					hot0->ppl_xrun_count[pi] = pxr;
+					ppl_sec->pipelines[pi].comp_count =
+						(uint8_t)(st->pipes[i].num_ll_modules +
+							  st->pipes[i].num_dp_modules);
+					break;
+				}
+			}
+		}
+	}
+	hot0->total_xrun_events = total_xruns;
+	ppl_sec->active_ppl_count = ppl_cnt;
+	ppl_sec->total_comp_count = comp_cnt;
+
+	/* 2. Memory & Heaps Section (0x0240) */
+	size_t hp_tot = (st && st->hw_cfg.hpsram_size_bytes) ?
+			st->hw_cfg.hpsram_size_bytes : (47UL * 65536UL);
+	size_t hp_used = st ? st->hw_cfg.hpsram_used_bytes : 65536UL;
+	size_t hp_peak = st ? st->hw_cfg.hpsram_peak_bytes : hp_used;
+	size_t lp_tot = (st && st->hw_cfg.lpsram_size_bytes) ?
+			st->hw_cfg.lpsram_size_bytes : 65536UL;
+	size_t lp_used = st ? st->hw_cfg.lpsram_used_bytes : 0UL;
+	size_t dram_tot = (st && st->hw_cfg.dram_size_bytes) ?
+			  st->hw_cfg.dram_size_bytes : (8UL * 1024UL * 1024UL);
+	size_t dram_used = st ? st->hw_cfg.dram_used_bytes : 0UL;
+
+	if (hp_used > hp_tot)
+		hp_used = hp_tot;
+	if (lp_used > lp_tot)
+		lp_used = lp_tot;
+	if (dram_used > dram_tot)
+		dram_used = dram_tot;
+
+	mem_sec->sram.hp_sram_total_pages = (uint16_t)(hp_tot / 4096UL);
+	mem_sec->sram.hp_sram_free_pages = (uint16_t)((hp_tot - hp_used) / 4096UL);
+	mem_sec->sram.lp_sram_total_pages = (uint16_t)(lp_tot / 4096UL);
+	mem_sec->sram.lp_sram_free_pages = (uint16_t)((lp_tot - lp_used) / 4096UL);
+	mem_sec->sram.ebb_power_mask_lo = 0xFFFFFFFFU;
+	mem_sec->sram.ebb_power_mask_hi = 0x00007FFFU;
+	mem_sec->sram.lpsram_ebb_mask = 0x00000001U;
+
+	/* Heap 0: SYS, Heap 1: SHARED, Heap 2: LL_USER, Heap 3: L3_IMR */
+	mem_sec->heaps[0].heap_type = SOF_TEL_HEAP_SYS;
+	mem_sec->heaps[0].alloc_fail_count = st ? (uint16_t)st->hw_cfg.alloc_failures : 0;
+	mem_sec->heaps[0].total_bytes = (uint32_t)(hp_tot / 2UL);
+	mem_sec->heaps[0].allocated_bytes = (uint32_t)(hp_used / 2UL);
+	mem_sec->heaps[0].free_bytes = mem_sec->heaps[0].total_bytes -
+				       mem_sec->heaps[0].allocated_bytes;
+	mem_sec->heaps[0].max_allocated_bytes = (uint32_t)(hp_peak / 2UL);
+
+	mem_sec->heaps[1].heap_type = SOF_TEL_HEAP_SHARED;
+	mem_sec->heaps[1].total_bytes = 65536U;
+	mem_sec->heaps[1].allocated_bytes = 4096U;
+	mem_sec->heaps[1].free_bytes = 61440U;
+	mem_sec->heaps[1].max_allocated_bytes = 4096U;
+
+	mem_sec->heaps[2].heap_type = SOF_TEL_HEAP_LL_USER;
+	mem_sec->heaps[2].total_bytes = (uint32_t)(hp_tot / 2UL);
+	mem_sec->heaps[2].allocated_bytes = (uint32_t)(hp_used - (hp_used / 2UL));
+	mem_sec->heaps[2].free_bytes = mem_sec->heaps[2].total_bytes -
+				       mem_sec->heaps[2].allocated_bytes;
+	mem_sec->heaps[2].max_allocated_bytes = (uint32_t)(hp_peak - (hp_peak / 2UL));
+
+	mem_sec->heaps[3].heap_type = SOF_TEL_HEAP_L3_IMR;
+	mem_sec->heaps[3].total_bytes = (uint32_t)dram_tot;
+	mem_sec->heaps[3].allocated_bytes = (uint32_t)dram_used;
+	mem_sec->heaps[3].free_bytes = (uint32_t)(dram_tot - dram_used);
+	mem_sec->heaps[3].max_allocated_bytes = st ? (uint32_t)st->hw_cfg.dram_peak_bytes : 0;
+
+	mem_sec->vmh_region_size = (uint32_t)hp_tot;
+	mem_sec->vmh_bundle_count = 4;
+	for (i = 0; i < 4; i++) {
+		mem_sec->vmh_bundles[i].blk_sz_shift = (uint8_t)(6 + i * 2);
+		mem_sec->vmh_bundles[i].total_blocks = (uint16_t)(64 >> i);
+		mem_sec->vmh_bundles[i].used_blocks =
+			(uint16_t)((ppl_cnt > 0 ? (i + 1) * 2 : 1));
+		mem_sec->vmh_bundles[i].max_blocks_or_oom = mem_sec->vmh_bundles[i].used_blocks;
+	}
+	mem_sec->fast_get.active_entries = comp_cnt > 0 ? 1 : 0;
+	mem_sec->fast_get.total_sram_bytes = comp_cnt > 0 ? 4096U : 0;
+	mem_sec->fast_get.peak_sram_bytes = comp_cnt > 0 ? 4096U : 0;
+	mem_sec->fast_get.total_get_calls = comp_cnt;
+
+	/* 3. Vregion Section (0x0340) */
+	vreg_sec->total_pages = mem_sec->sram.hp_sram_total_pages;
+	vreg_sec->free_pages = mem_sec->sram.hp_sram_free_pages;
+	vreg_sec->min_free_pages = mem_sec->sram.hp_sram_free_pages;
+	vreg_sec->num_elems_in_use = ppl_cnt > 0 ? 2 : 1;
+	vreg_sec->region_base_va = 0xA0000000U;
+	vreg_sec->velems[0].vpage = 0;
+	vreg_sec->velems[0].pages =
+		(uint16_t)(vreg_sec->total_pages - vreg_sec->free_pages);
+	vreg_sec->active_vregion_count = 1;
+	vreg_sec->total_vregions_created = 1;
+	vreg_sec->vregions[0].base_va = 0xA0000000U;
+	vreg_sec->vregions[0].total_pages = vreg_sec->velems[0].pages;
+	vreg_sec->vregions[0].use_count = 1;
+	vreg_sec->vregions[0].lifetime_size_bytes = (uint32_t)(hp_tot / 2UL);
+	vreg_sec->vregions[0].lifetime_used_bytes = (uint32_t)hp_used;
+
+	/* 4. Zephyr RTOS Threads Section (0x07C0) */
+	uint16_t thd_cnt = 0;
+	uint32_t ncores = st ? st->hw_cfg.num_cores : CONFIG_CORE_COUNT;
+
+	if (ncores > SOF_TEL_MAX_CORES)
+		ncores = SOF_TEL_MAX_CORES;
+	for (c = 0; c < (int)ncores; c++) {
+		uint32_t util_pct = (st && c < TB_TELEM_MAX_CORES) ?
+				    (st->cores[c].total_util_x100 / 100U) : 2U;
+		if (util_pct > 100U)
+			util_pct = 100U;
+		uint8_t active_scaled = (uint8_t)((util_pct * 255U) / 100U);
+
+		thd_sec->core_load[c] = active_scaled;
+
+		/* LL thread on core c */
+		if (thd_cnt < SOF_TEL_MAX_THREADS) {
+			struct sof_tel_thread_info *ti = &thd_sec->threads[thd_cnt++];
+
+			ti->thread_id = 0x1000U + (uint32_t)c;
+			ti->core = (uint8_t)c;
+			ti->prio = -10;
+			ti->state = 0;
+			ti->cpu_load = active_scaled;
+			ti->stack_usage = 64; /* ~25% */
+			ti->flags = SOF_TEL_THD_FLG_LL;
+			ti->stack_size_chunks = 8192 / 64;
+			ti->total_exec_kcycles =
+				(st && c < TB_TELEM_MAX_CORES) ?
+				(uint32_t)(st->cores[c].ll_total_cycles >> 10) :
+				(g_core_ticks[c].last_ccount >> 10);
+			snprintf(ti->name, sizeof(ti->name), "ll_c%d", c);
+		}
+		/* Idle thread on core c */
+		if (thd_cnt < SOF_TEL_MAX_THREADS) {
+			struct sof_tel_thread_info *ti = &thd_sec->threads[thd_cnt++];
+
+			ti->thread_id = 0x2000U + (uint32_t)c;
+			ti->core = (uint8_t)c;
+			ti->prio = 15;
+			ti->state = 0;
+			ti->cpu_load = (uint8_t)(255U - active_scaled);
+			ti->stack_usage = 32; /* ~12.5% */
+			ti->flags = SOF_TEL_THD_FLG_IDLE;
+			ti->stack_size_chunks = 4096 / 64;
+			ti->total_exec_kcycles = (uint32_t)(g_total_ticks * 100ULL);
+			snprintf(ti->name, sizeof(ti->name), "idle %02d", c);
+		}
+	}
+	thd_sec->thread_count = thd_cnt;
+	thd_sec->sample_seq = (uint32_t)g_total_ticks;
+
+	/* 5. TEL2 Self-Describing Directory Header at 0x0100 */
+	ehdr->magic = SOF_TEL_EXT_MAGIC;
+	ehdr->version = SOF_TEL_EXT_VERSION;
+	ehdr->max_cores = SOF_TEL_MAX_CORES;
+	ehdr->num_secs = 6;
+	ehdr->seq = (uint32_t)(g_total_ticks * 2ULL); /* Even = consistent */
+	ehdr->timestamp_us = (uint32_t)(g_total_ticks * 1000ULL);
+
+	ehdr->secs[0].id = SOF_TEL_SEC_HOT_ZONE;
+	ehdr->secs[0].elem_size = 0;
+	ehdr->secs[0].offset = SOF_TEL_OFF_HOT_LINE0;
+	ehdr->secs[0].max_count = 256;
+	ehdr->secs[0].active_mask = 1;
+
+	ehdr->secs[1].id = SOF_TEL_SEC_MEMORY;
+	ehdr->secs[1].elem_size = sizeof(struct sof_tel_heap_info);
+	ehdr->secs[1].offset = SOF_TEL_OFF_MEM_SEC;
+	ehdr->secs[1].max_count = SOF_TEL_MAX_HEAPS;
+	ehdr->secs[1].active_mask = 0x0F;
+
+	ehdr->secs[2].id = SOF_TEL_SEC_VREGION;
+	ehdr->secs[2].elem_size = sizeof(struct sof_tel_vregion_info);
+	ehdr->secs[2].offset = SOF_TEL_OFF_VREG_SEC;
+	ehdr->secs[2].max_count = SOF_TEL_MAX_VREGIONS;
+	ehdr->secs[2].active_mask = vreg_sec->active_vregion_count;
+
+	ehdr->secs[3].id = SOF_TEL_SEC_PIPELINES;
+	ehdr->secs[3].elem_size = sizeof(struct sof_tel_ppl_info);
+	ehdr->secs[3].offset = SOF_TEL_OFF_PPL_SEC;
+	ehdr->secs[3].max_count = SOF_TEL_MAX_PIPELINES;
+	ehdr->secs[3].active_mask = ppl_cnt;
+
+	ehdr->secs[4].id = SOF_TEL_SEC_DAIS;
+	ehdr->secs[4].elem_size = sizeof(struct sof_tel_gw_cold);
+	ehdr->secs[4].offset = SOF_TEL_OFF_DAI_SEC;
+	ehdr->secs[4].max_count = SOF_TEL_MAX_GATEWAYS;
+	ehdr->secs[4].active_mask = gw_cnt;
+
+	ehdr->secs[5].id = SOF_TEL_SEC_THREADS;
+	ehdr->secs[5].elem_size = sizeof(struct sof_tel_thread_info);
+	ehdr->secs[5].offset = SOF_TEL_OFF_THD_SEC;
+	ehdr->secs[5].max_count = SOF_TEL_MAX_THREADS;
+	ehdr->secs[5].active_mask = thd_cnt;
+
+	/* Window 3: Perf window (8,192 B with PMW2 partitions) */
 	uint8_t tmp_perf[4096];
 
 	build_ext_perf_tlv(tp, tmp_perf, sizeof(tmp_perf));
@@ -3711,12 +4142,25 @@ static int handle_telem_snapshot(int sock, uint32_t req_id, const uint8_t *req_b
 	struct sof_net_telem_req req = {
 		.query_mask = SOF_TELEM_FL_FW_REGS |
 			      SOF_TELEM_FL_TELEM_SLOT |
-			      SOF_TELEM_FL_EXT_PERF_TLV,
+			      SOF_TELEM_FL_PERF_WIN3 |
+			      SOF_TELEM_FL_EXT_PERF_TLV |
+			      SOF_TELEM_FL_TEL2_SLOT |
+			      SOF_TELEM_FL_PMW2_WIN3,
 		.flags = 0,
 	};
 
 	if (req_len >= sizeof(req))
 		memcpy(&req, req_buf, sizeof(req));
+	if (req.flags & SOF_TELEM_FL_COMPRESS)
+		g_client_accepts_compressed = true;
+	bool hot_only = ((req.query_mask | req.flags) & SOF_TELEM_FL_HOT_ONLY) != 0;
+
+	if (hot_only) {
+		req.query_mask &= ~(SOF_TELEM_FL_MEM_STATE_TLV |
+				    SOF_TELEM_FL_PWR_STATE_TLV |
+				    SOF_TELEM_FL_EXT_PERF_TLV |
+				    SOF_TELEM_FL_MODULES_INFO_TLV);
+	}
 
 	struct sof_net_telem_snapshot *snap = calloc(1, sizeof(*snap));
 
@@ -3735,14 +4179,41 @@ static int handle_telem_snapshot(int sock, uint32_t req_id, const uint8_t *req_b
 		snap->flags_present |= SOF_TELEM_FL_FW_REGS;
 	}
 
-	if (req.query_mask & SOF_TELEM_FL_TELEM_SLOT) {
-		memcpy(snap->telem_slot, g_win2_debug + 4096, sizeof(snap->telem_slot));
+	if (req.query_mask & (SOF_TELEM_FL_TELEM_SLOT | SOF_TELEM_FL_TEL2_SLOT)) {
+		uint32_t sep = 0x0000C0DEU;
+		uint32_t t2_sz = hot_only ? SOF_TEL_HOT_ZONE_BYTES :
+				 (uint32_t)sizeof(snap->tel2_slot);
+		size_t ticks_sz = sizeof(g_core_ticks);
+
+		if (4U + ticks_sz > sizeof(snap->telem_slot))
+			ticks_sz = sizeof(snap->telem_slot) - 4U;
+		memcpy(snap->telem_slot, &sep, 4);
+		memcpy(snap->telem_slot + 4, g_core_ticks, ticks_sz);
 		snap->flags_present |= SOF_TELEM_FL_TELEM_SLOT;
+		if (req.query_mask & SOF_TELEM_FL_TEL2_SLOT) {
+			memcpy(snap->tel2_slot, g_win2_debug + 4096, t2_sz);
+			snap->tel2_slot_len = t2_sz;
+			snap->flags_present |= SOF_TELEM_FL_TEL2_SLOT |
+					       (hot_only ? SOF_TELEM_FL_HOT_ONLY : 0);
+		}
 	}
 
 	if (req.query_mask & SOF_TELEM_FL_PERF_WIN3) {
-		memcpy(snap->perf_win3, g_win3_perf, sizeof(snap->perf_win3));
+		memcpy(snap->perf_win3, g_win3_legacy, sizeof(snap->perf_win3));
 		snap->flags_present |= SOF_TELEM_FL_PERF_WIN3;
+	}
+
+	if (req.query_mask & SOF_TELEM_FL_PMW2_WIN3) {
+		if (hot_only) {
+			memcpy(snap->pmw2_win3, g_win3_perf, SOF_TEL_MW3_MOD_COLD_OFFSET);
+			memcpy(snap->pmw2_win3 + SOF_TEL_MW3_HDR_OFFSET,
+			       g_win3_perf + SOF_TEL_MW3_HDR_OFFSET,
+			       sizeof(struct sof_tel_mw3_hdr));
+		} else {
+			memcpy(snap->pmw2_win3, g_win3_perf, sizeof(snap->pmw2_win3));
+		}
+		snap->pmw2_win3_len = sizeof(snap->pmw2_win3);
+		snap->flags_present |= SOF_TELEM_FL_PMW2_WIN3;
 	}
 
 	if (req.query_mask & SOF_TELEM_FL_MEM_STATE_TLV) {
@@ -3775,7 +4246,14 @@ static int handle_telem_snapshot(int sock, uint32_t req_id, const uint8_t *req_b
 
 	pthread_mutex_unlock(&g_tb_lock);
 
-	int ret = send_reply(sock, SOF_NET_OP_TELEM_SNAPSHOT, req_id, 0, snap, sizeof(*snap));
+	uint32_t send_sz = (req.query_mask & (SOF_TELEM_FL_TEL2_SLOT | SOF_TELEM_FL_PMW2_WIN3)) ?
+			   (uint32_t)sizeof(*snap) : SOF_NET_TELEM_SNAPSHOT_V1_SIZE;
+	if (send_sz == SOF_NET_TELEM_SNAPSHOT_V1_SIZE) {
+		snap->flags_present &= ~(SOF_TELEM_FL_TEL2_SLOT |
+					 SOF_TELEM_FL_PMW2_WIN3 |
+					 SOF_TELEM_FL_HOT_ONLY);
+	}
+	int ret = send_reply(sock, SOF_NET_OP_TELEM_SNAPSHOT, req_id, 0, snap, send_sz);
 
 	free(snap);
 	return ret;
@@ -5000,6 +5478,9 @@ static void *tb_client_worker_fn(void *arg)
 			break;
 		}
 
+		g_client_accepts_compressed = (hdr.opcode & SOF_NET_OP_FLAG_COMPRESSED) != 0;
+		hdr.opcode &= SOF_NET_OP_MASK;
+
 		uint8_t *req_buf = NULL;
 
 		if (hdr.payload_len > 0) {
@@ -5011,6 +5492,19 @@ static void *tb_client_worker_fn(void *arg)
 				break;
 			}
 			req_buf[hdr.payload_len] = '\0';
+			if (g_client_accepts_compressed &&
+			    hdr.payload_len >= sizeof(struct sof_net_comp_hdr) &&
+			    *(const uint32_t *)req_buf == SOF_NET_COMP_MAGIC) {
+				uint8_t *dbuf = NULL;
+				uint32_t dlen = 0;
+
+				if (sof_net_decompress(req_buf, hdr.payload_len,
+						       &dbuf, &dlen) == 0) {
+					free(req_buf);
+					req_buf = dbuf;
+					hdr.payload_len = dlen;
+				}
+			}
 		}
 
 		int rc = 0;

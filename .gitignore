@@ -11,6 +11,8 @@ dist/
 .eggs/
 *.o
 *.a
+sof-remote-server/sof_remote_server
+sof-remote-server/sof-remote
 
 # Virtual environments
 .venv/
