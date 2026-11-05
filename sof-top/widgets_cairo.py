@@ -101,58 +101,71 @@ def draw_panel_box(
 
 
 # =============================================================================
-# 0. USER EDITION WIDGET: UserDashboardCairoWidget (sof-top)
+# 0. USER EDITION RENDERER & WIDGET: UserDashboardRenderer / UserDashboardCairoWidget
 # =============================================================================
-class UserDashboardCairoWidget(Gtk.Widget):
+class UserDashboardRenderer:
     """
-    Single-screen User Edition Dashboard for `sof-top`:
-      1) Top-Left: Moving Graph for DSP Core Utilization + Live Per-Core Bars
-      2) Top-Right: Moving Graph for DSP Memory Utilization (SRAM: HPSRAM+LPSRAM,
-         DRAM: L3/IMR, and DSP Heaps) + Live Memory Bars
-      3) Bottom: Unified DSP Task List with Resources & Status
+    Display-independent state, 60-second timestamped history, scrollable task
+    state, and Cairo renderer for `sof-top`. Can be used directly in headless
+    CI environments (`--render-png`) without constructing a `Gtk.Widget`.
     """
 
-    def __init__(self, history_len: int = 300):
-        super().__init__()
-        self.history_len = history_len
+    def __init__(self, window_seconds: float = 60.0, max_samples: int = 1200):
+        self.window_seconds = float(window_seconds)
+        self.max_samples = max_samples
         self.snap: TelemetrySnapshot = TelemetrySnapshot()
-        self.core_pct_hist: Dict[int, Deque[float]] = collections.defaultdict(
-            lambda: collections.deque(maxlen=history_len)
+        self.core_pct_hist: Dict[int, Deque[Tuple[float, float]]] = collections.defaultdict(
+            lambda: collections.deque(maxlen=max_samples)
         )
-        self.sram_kb_hist: Deque[float] = collections.deque(maxlen=history_len)
-        self.hpsram_kb_hist: Deque[float] = collections.deque(maxlen=history_len)
-        self.lpsram_kb_hist: Deque[float] = collections.deque(maxlen=history_len)
-        self.dram_kb_hist: Deque[float] = collections.deque(maxlen=history_len)
-        self.heap_kb_hist: Deque[float] = collections.deque(maxlen=history_len)
-        self.set_size_request(960, 620)
-        self.set_hexpand(True)
-        self.set_vexpand(True)
+        self.sram_kb_hist: Deque[Tuple[float, float]] = collections.deque(maxlen=max_samples)
+        self.hpsram_kb_hist: Deque[Tuple[float, float]] = collections.deque(maxlen=max_samples)
+        self.lpsram_kb_hist: Deque[Tuple[float, float]] = collections.deque(maxlen=max_samples)
+        self.dram_kb_hist: Deque[Tuple[float, float]] = collections.deque(maxlen=max_samples)
+        self.heap_kb_hist: Deque[Tuple[float, float]] = collections.deque(maxlen=max_samples)
+        self.task_scroll_offset: int = 0
+        self.last_max_rows: int = 10
+
+    def _prune_old(self, deq: Deque[Tuple[float, float]], cutoff: float):
+        while len(deq) > 1 and deq[0][0] < cutoff:
+            deq.popleft()
+
+    def scroll_tasks(self, delta_rows: int) -> bool:
+        total = len(self.snap.tasks)
+        max_off = max(0, total - max(1, self.last_max_rows))
+        new_off = max(0, min(max_off, self.task_scroll_offset + delta_rows))
+        if new_off != self.task_scroll_offset:
+            self.task_scroll_offset = new_off
+            return True
+        return False
 
     def update_snapshot(self, snap: TelemetrySnapshot):
         self.snap = snap
+        ts = snap.timestamp if snap.timestamp > 0 else time.time()
+        cutoff = ts - self.window_seconds
+
         for ct in snap.cores:
-            self.core_pct_hist[ct.core_id].append(float(ct.cpu_load_pct))
+            deq = self.core_pct_hist[ct.core_id]
+            deq.append((ts, float(ct.cpu_load_pct)))
+            self._prune_old(deq, cutoff)
 
         hp_kb = float(snap.hpsram.powered_banks * 128)
         lp_kb = float(snap.lpsram.powered_banks * 64)
         dram_kb = float(snap.dram_used_kb)
         heap_kb = float(snap.heap_allocated_bytes) / 1024.0
 
-        self.sram_kb_hist.append(hp_kb + lp_kb)
-        self.hpsram_kb_hist.append(hp_kb)
-        self.lpsram_kb_hist.append(lp_kb)
-        self.dram_kb_hist.append(dram_kb)
-        self.heap_kb_hist.append(heap_kb)
-        self.queue_draw()
+        for deq, val in (
+            (self.sram_kb_hist, hp_kb + lp_kb),
+            (self.hpsram_kb_hist, hp_kb),
+            (self.lpsram_kb_hist, lp_kb),
+            (self.dram_kb_hist, dram_kb),
+            (self.heap_kb_hist, heap_kb),
+        ):
+            deq.append((ts, val))
+            self._prune_old(deq, cutoff)
 
-    def do_snapshot(self, snapshot: Gtk.Snapshot):
-        w = float(self.get_width())
-        h = float(self.get_height())
-        if w <= 10 or h <= 10:
-            return
-        rect = Graphene.Rect().init(0, 0, w, h)
-        cr = snapshot.append_cairo(rect)
-        self.render_to_cairo(cr, w, h, self)
+        max_off = max(0, len(snap.tasks) - max(1, self.last_max_rows))
+        if self.task_scroll_offset > max_off:
+            self.task_scroll_offset = max_off
 
     def render_to_cairo(
         self,
@@ -275,7 +288,7 @@ class UserDashboardCairoWidget(Gtk.Widget):
         for cid in range(num_cores):
             deq = self.core_pct_hist.get(cid)
             if deq:
-                max_pct = max(max_pct, max(deq) * 1.25)
+                max_pct = max(max_pct, max(v for _, v in deq) * 1.25)
         max_pct = min(100.0, max(10.0, max_pct))
 
         draw_pango_text(
@@ -299,10 +312,13 @@ class UserDashboardCairoWidget(Gtk.Widget):
             if len(samples) < 2:
                 continue
             ccol = CORE_COLORS[cid % len(CORE_COLORS)]
-            dx = cplot_w / max(1, len(samples) - 1)
+            t_end = samples[-1][0]
+            t_span = max(0.001, min(self.window_seconds, max(1.0, t_end - samples[0][0])))
+            t_start = t_end - t_span
             pts = []
-            for idx_s, val in enumerate(samples):
-                px = cplot_x + idx_s * dx
+            for ts_s, val in samples:
+                x_frac = min(1.0, max(0.0, (ts_s - t_start) / t_span))
+                px = cplot_x + x_frac * cplot_w
                 norm = min(1.0, max(0.0, val / max_pct))
                 py = cplot_y + cplot_h - norm * cplot_h
                 pts.append((px, py))
@@ -335,13 +351,13 @@ class UserDashboardCairoWidget(Gtk.Widget):
         hp = self.snap.hpsram
         lp = self.snap.lpsram
         hp_pwr_kb = hp.powered_banks * 128.0
-        hp_tot_kb = max(128.0, hp.total_banks * 128.0)
+        hp_tot_kb = hp.total_banks * 128.0
         lp_pwr_kb = lp.powered_banks * 64.0
-        lp_tot_kb = max(64.0, lp.total_banks * 64.0)
+        lp_tot_kb = lp.total_banks * 64.0
         dram_used_kb = self.snap.dram_used_kb
-        dram_tot_kb = max(512.0, self.snap.dram_total_kb)
+        dram_tot_kb = self.snap.dram_total_kb
         heap_used_kb = self.snap.heap_allocated_bytes / 1024.0
-        heap_tot_kb = max(256.0, self.snap.heap_total_bytes / 1024.0)
+        heap_tot_kb = self.snap.heap_total_bytes / 1024.0
 
         draw_pango_text(
             widget,
@@ -374,7 +390,7 @@ class UserDashboardCairoWidget(Gtk.Widget):
             cr.rectangle(mbx, mby, mbw, mbh)
             cr.fill()
 
-            mfrac = min(1.0, max(0.0, m_use / max(1.0, m_tot)))
+            mfrac = min(1.0, max(0.0, m_use / m_tot)) if m_tot > 0 else 0.0
             if mfrac > 0:
                 cr.set_source_rgb(*mcol)
                 cr.rectangle(mbx, mby, mbw * mfrac, mbh)
@@ -397,7 +413,7 @@ class UserDashboardCairoWidget(Gtk.Widget):
         draw_pango_text(
             widget,
             cr,
-            "MOVING GRAPH: HPSRAM (Green) | LPSRAM (Cyan) | DRAM/IMR (Violet) | Heaps (Amber)",
+            "MOVING GRAPH (60s): HPSRAM (Green) | LPSRAM (Cyan) | DRAM/IMR (Violet) | Heaps (Amber)",
             rx + 10,
             mplot_y - 15.0,
             "Monospace Bold 7.6",
@@ -412,7 +428,7 @@ class UserDashboardCairoWidget(Gtk.Widget):
             cr.line_to(mplot_x + mplot_w, gy_line)
             cr.stroke()
 
-        y_max_kb = float(max(1024.0, hp_tot_kb, dram_used_kb * 1.3))
+        y_max_kb = float(max(1024.0, hp_tot_kb, dram_used_kb * 1.3, heap_used_kb * 1.3))
         draw_pango_text(
             widget, cr, f"{y_max_kb:4.0f}K", rx + 6, mplot_y - 2, "Monospace 7", TEXT_MUTED
         )
@@ -438,10 +454,13 @@ class UserDashboardCairoWidget(Gtk.Widget):
             s_list = list(series)
             if len(s_list) < 2:
                 continue
-            dx = mplot_w / max(1, len(s_list) - 1)
+            t_end = s_list[-1][0]
+            t_span = max(0.001, min(self.window_seconds, max(1.0, t_end - s_list[0][0])))
+            t_start = t_end - t_span
             pts = []
-            for idx_s, val in enumerate(s_list):
-                px = mplot_x + idx_s * dx
+            for ts_s, val in s_list:
+                x_frac = min(1.0, max(0.0, (ts_s - t_start) / t_span))
+                px = mplot_x + x_frac * mplot_w
                 py = mplot_y + mplot_h - min(1.0, max(0.0, val / y_max_kb)) * mplot_h
                 pts.append((px, py))
 
@@ -461,7 +480,7 @@ class UserDashboardCairoWidget(Gtk.Widget):
             cr.stroke()
 
         # =====================================================================
-        # 3. BOTTOM: Unified DSP Task List (Resources & Status)
+        # 3. BOTTOM: Unified Scrollable DSP Task List (Resources & Status)
         # =====================================================================
         by_box = pad * 2 + top_h
         bw_box = w - pad * 2
@@ -469,17 +488,32 @@ class UserDashboardCairoWidget(Gtk.Widget):
 
         tasks = self.snap.tasks
         running_cnt = sum(1 for t in tasks if t.status == "RUNNING")
+
+        th_y = by_box + 26.0
+        row_y = th_y + 19.0
+        row_step = 18.0
+        max_rows = max(1, int((bot_h - (row_y - by_box) - 6.0) // row_step))
+        self.last_max_rows = max_rows
+
+        max_off = max(0, len(tasks) - max_rows)
+        start_idx = max(0, min(self.task_scroll_offset, max_off))
+        end_idx = min(len(tasks), start_idx + max_rows)
+        range_str = (
+            f"Showing {start_idx + 1}..{end_idx} of {len(tasks)} [Mouse Wheel / PgUp / PgDn]"
+            if len(tasks) > max_rows
+            else f"{len(tasks)} Tasks"
+        )
+
         draw_pango_text(
             widget,
             cr,
-            f"DSP TASK LIST (RESOURCES & STATUS) — {len(tasks)} Tasks ({running_cnt} Running | FW: {self.snap.fw_filename} v{self.snap.fw_version} [{self.snap.fw_state_name}])",
+            f"DSP TASK LIST (RESOURCES & STATUS) — {range_str} ({running_cnt} Running | FW: {self.snap.fw_filename} v{self.snap.fw_version} [{self.snap.fw_state_name}])",
             pad + 10,
             by_box + 6,
             "Monospace Bold 9",
             ACCENT_GREEN,
         )
 
-        th_y = by_box + 26.0
         col_hdr = (
             f"{'TASK ID':<10} {'TASK / MODULE NAME':<20} {'TYPE':<12} {'CORE':<5} "
             f"{'STATUS':<10} {'CPU %':>7}   {'CPU BAR':<12} {'AVG KCPS':>9} {'PEAK KCPS':>9}   "
@@ -492,14 +526,10 @@ class UserDashboardCairoWidget(Gtk.Widget):
         cr.line_to(w - pad - 8, th_y + 15)
         cr.stroke()
 
-        row_y = th_y + 19.0
-        row_step = 18.0
-        max_rows = max(1, int((bot_h - (row_y - by_box) - 6.0) // row_step))
-
-        for idx_t, t in enumerate(tasks[:max_rows]):
-            if idx_t % 2 == 0:
+        for idx_t, t in enumerate(tasks[start_idx:end_idx]):
+            if (start_idx + idx_t) % 2 == 0:
                 cr.set_source_rgba(1.0, 1.0, 1.0, 0.025)
-                cr.rectangle(pad + 6, row_y - 1, bw_box - 12, row_step - 1)
+                cr.rectangle(pad + 6, row_y - 1, bw_box - 18, row_step - 1)
                 cr.fill()
 
             if t.status in ("XRUN!", "CPC_VIOL"):
@@ -512,7 +542,7 @@ class UserDashboardCairoWidget(Gtk.Widget):
                 st_col = TEXT_MUTED
 
             # Build inline ASCII bar for CPU load
-            filled = int( round(min(1.0, max(0.0, t.cpu_pct / 25.0)) * 10) )
+            filled = int(round(min(1.0, max(0.0, t.cpu_pct / 25.0)) * 10))
             bar_str = "[" + ("#" * filled).ljust(10, ".") + "]"
 
             row_s = (
@@ -522,4 +552,100 @@ class UserDashboardCairoWidget(Gtk.Widget):
             )
             draw_pango_text(widget, cr, row_s, pad + 12, row_y, "Monospace 8", st_col)
             row_y += row_step
+
+        # Draw vertical scrollbar when tasks exceed visible rows
+        if len(tasks) > max_rows:
+            sb_x = pad + bw_box - 10.0
+            sb_y = th_y + 18.0
+            sb_h = max(24.0, bot_h - (sb_y - by_box) - 8.0)
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.08)
+            cr.rectangle(sb_x, sb_y, 5.0, sb_h)
+            cr.fill()
+            thumb_h = max(16.0, sb_h * (max_rows / float(len(tasks))))
+            thumb_y = sb_y + (sb_h - thumb_h) * (start_idx / float(max(1, max_off)))
+            cr.set_source_rgb(*ACCENT_CYAN)
+            cr.rectangle(sb_x, thumb_y, 5.0, thumb_h)
+            cr.fill()
+
+
+class UserDashboardCairoWidget(Gtk.Widget):
+    """
+    Single-screen User Edition GTK4 Widget for `sof-top` wrapping `UserDashboardRenderer`.
+    Supports mouse-wheel and keyboard scrolling through the DSP Task List.
+    """
+
+    def __init__(self, window_seconds: float = 60.0):
+        super().__init__()
+        self.renderer = UserDashboardRenderer(window_seconds=window_seconds)
+        self.set_size_request(960, 620)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.set_focusable(True)
+
+        scroll_ctrl = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll_ctrl.connect("scroll", self._on_scroll)
+        self.add_controller(scroll_ctrl)
+
+        key_ctrl = Gtk.EventControllerKey.new()
+        key_ctrl.connect("key-pressed", self._on_key_pressed)
+        self.add_controller(key_ctrl)
+
+    @property
+    def snap(self) -> TelemetrySnapshot:
+        return self.renderer.snap
+
+    def scroll_tasks(self, delta_rows: int):
+        if self.renderer.scroll_tasks(delta_rows):
+            self.queue_draw()
+
+    def _on_scroll(self, _ctrl, _dx: float, dy: float) -> bool:
+        step = 3 if dy > 0 else (-3 if dy < 0 else 0)
+        if step != 0:
+            self.scroll_tasks(step)
+            return True
+        return False
+
+    def _on_key_pressed(self, _ctrl, keyval: int, _keycode: int, _state) -> bool:
+        page = max(1, self.renderer.last_max_rows - 1)
+        if keyval == Gdk.KEY_Down:
+            self.scroll_tasks(1)
+            return True
+        if keyval == Gdk.KEY_Up:
+            self.scroll_tasks(-1)
+            return True
+        if keyval == Gdk.KEY_Page_Down:
+            self.scroll_tasks(page)
+            return True
+        if keyval == Gdk.KEY_Page_Up:
+            self.scroll_tasks(-page)
+            return True
+        if keyval == Gdk.KEY_Home:
+            self.scroll_tasks(-10000)
+            return True
+        if keyval == Gdk.KEY_End:
+            self.scroll_tasks(10000)
+            return True
+        return False
+
+    def update_snapshot(self, snap: TelemetrySnapshot):
+        self.renderer.update_snapshot(snap)
+        self.queue_draw()
+
+    def do_snapshot(self, snapshot: Gtk.Snapshot):
+        w = float(self.get_width())
+        h = float(self.get_height())
+        if w <= 10 or h <= 10:
+            return
+        rect = Graphene.Rect().init(0, 0, w, h)
+        cr = snapshot.append_cairo(rect)
+        self.renderer.render_to_cairo(cr, w, h, self)
+
+    def render_to_cairo(
+        self,
+        cr: cairo.Context,
+        w: float,
+        h: float,
+        widget: Optional[Gtk.Widget] = None,
+    ):
+        self.renderer.render_to_cairo(cr, w, h, widget)
 

@@ -577,11 +577,18 @@ class TelemetryParser:
         self.prev_ts: float = 0.0
         self.prev_ticks: Dict[int, int] = {}
         self.prev_ccount: Dict[int, int] = {}
-        self.cached_modules: Dict[int, str] = dict(WELL_KNOWN_IPC4_MODULES)
+        self.module_name_lookup: Dict[int, str] = dict(WELL_KNOWN_IPC4_MODULES)
+        self.cached_modules: Dict[int, str] = {}
         self.cached_hpsram: Optional[SramSegmentState] = None
         self.cached_lpsram: Optional[SramSegmentState] = None
         self.cached_core_kcps: Dict[int, int] = {}
         self.cached_ext_perf: List[ComponentPerfItem] = []
+
+    def lookup_module_name(self, mod_id: int) -> str:
+        return (
+            self.cached_modules.get(mod_id)
+            or self.module_name_lookup.get(mod_id, f"mod_0x{mod_id:02x}")
+        )
 
     def parse_cdev_info_into(self, raw_info: bytes, snap: TelemetrySnapshot):
         if len(raw_info) < 140:
@@ -653,6 +660,8 @@ class TelemetryParser:
             if mname:
                 self.cached_modules[mod_id_rt] = mname
                 self.cached_modules[idx] = mname
+                self.module_name_lookup[mod_id_rt] = mname
+                self.module_name_lookup[idx] = mname
             off += 116
 
     def parse_memory_state_tlv(self, data: bytes):
@@ -726,7 +735,10 @@ class TelemetryParser:
         if len(data) < 4:
             return
         (count,) = struct.unpack_from("<I", data, 0)
-        if count == 0 or count > 256:
+        if count == 0:
+            self.cached_ext_perf = []
+            return
+        if count > 256:
             return
         items: List[ComponentPerfItem] = []
         off = 4
@@ -768,12 +780,14 @@ class TelemetryParser:
             off += stride
             if res_id == 0 and peak_kcps == 0 and avg_kcps == 0 and cycles == 0:
                 continue
+            if res_id == 0xFFFFFFFF:
+                continue
             mod_id = res_id & 0xFFFF
             inst_id = (res_id >> 16) & 0xFFFF
             mname = (
                 f"Core {inst_id} Summary"
                 if mod_id == 0
-                else self.cached_modules.get(mod_id, f"mod_0x{mod_id:02x}")
+                else self.lookup_module_name(mod_id)
             )
             pmode = "DP" if (flags & 1) else "LL"
             removed = bool((flags >> 31) & 1)
@@ -792,8 +806,7 @@ class TelemetryParser:
                     total_cycles=cycles,
                 )
             )
-        if items:
-            self.cached_ext_perf = items
+        self.cached_ext_perf = items
 
     def parse_tel2_and_pmw2(self, tel2: bytes, pmw2: bytes, snap: TelemetrySnapshot):
         """Parse Extended Telemetry v2 (TEL2 4KB slot & PMW2 8KB window)."""
@@ -1013,7 +1026,7 @@ class TelemetryParser:
                 for g_i in range(16):
                     goff = dai_off + g_i * 16
                     gtype, gidx, gdir, gdma, gcomp, gst, ggrp, gper, gbuf = (
-                        struct.unpack_from("<BBBbHBBII", tel2, goff)
+                        struct.unpack_from("<BBBbIBBHI", tel2, goff)
                     )
                     tot_kbf, avail_b, xrun_c = (
                         gw_hot_list[g_i] if g_i < len(gw_hot_list) else (0, 0, 0)
@@ -1066,79 +1079,77 @@ class TelemetryParser:
                         )
                     )
 
-        # Parse PMW2 (MW3 8KB window)
+        # Parse PMW2 (MW3 8KB window) only when the PMW2 header is valid
         if len(pmw2) >= 8192:
             (mw3_magic,) = struct.unpack_from("<I", pmw2, SOF_TEL_MW3_HDR_OFFSET)
             if mw3_magic == SOF_TEL_MW3_MAGIC:
                 snap.pmw2_present = True
-            # Parse mod_cold[88] (16B each at 0x1200) and mod_hot[88] (4B each at 0x1080)
-            cold_by_res: Dict[int, Tuple[int, int, int]] = {}
-            for i in range(SOF_TEL_MW3_MAX_COMP_ITEMS):
-                coff = SOF_TEL_MW3_MOD_COLD_OFFSET + i * 16
-                c_res, c_heap, c_hwm, c_cpc = struct.unpack_from("<IIII", pmw2, coff)
-                if c_res not in (0, 0xFFFFFFFF):
-                    cold_by_res[c_res] = (c_heap, c_hwm, c_cpc)
+                # Parse mod_cold[88] (16B each at 0x1200) and mod_hot[88] (4B each at 0x1080)
+                cold_by_res: Dict[int, Tuple[int, int, int]] = {}
+                for i in range(SOF_TEL_MW3_MAX_COMP_ITEMS):
+                    coff = SOF_TEL_MW3_MOD_COLD_OFFSET + i * 16
+                    c_res, c_heap, c_hwm, c_cpc = struct.unpack_from("<IIII", pmw2, coff)
+                    if c_res not in (0, 0xFFFFFFFF):
+                        cold_by_res[c_res] = (c_heap, c_hwm, c_cpc)
 
-            pmw_comps: List[ComponentPerfItem] = []
-            for i in range(SOF_TEL_MW3_MAX_COMP_ITEMS):
-                poff = i * SOF_TEL_MW3_COMP_PERF_STRIDE
-                (
-                    res_id,
-                    flags,
-                    peak_k,
-                    avg_k,
-                    iters,
-                    tot_cyc,
-                    r_peak,
-                    r_iters,
-                    r_cyc,
-                ) = struct.unpack_from("<IIIIIQIQQ", pmw2, poff)
-                if res_id in (0, 0xFFFFFFFF) and peak_k == 0 and avg_k == 0 and iters == 0:
-                    continue
-                if res_id == 0:
-                    continue
-                hoff = SOF_TEL_MW3_MOD_HOT_OFFSET + i * 4
-                cpc_v, xrun_v = struct.unpack_from("<HH", pmw2, hoff)
-                c_heap, c_hwm, c_cpc = cold_by_res.get(res_id, (0, 0, 0))
-                mod_id = res_id & 0xFFFF
-                inst_id = (res_id >> 16) & 0xFFFF
-                mname = self.cached_modules.get(mod_id, f"mod_0x{mod_id:02x}")
-                pmw_comps.append(
-                    ComponentPerfItem(
-                        resource_id=res_id,
-                        module_id=mod_id,
-                        instance_id=inst_id,
-                        module_name=mname,
-                        core_id=0,
-                        power_mode="DP" if (flags & 1) else "LL",
-                        is_removed=bool((flags >> 31) & 1),
-                        avg_kcps=avg_k,
-                        peak_kcps=peak_k,
-                        iterations=iters,
-                        total_cycles=tot_cyc,
-                        restricted_peak_cycles=r_peak,
-                        restricted_iterations=r_iters,
-                        restricted_cycles=r_cyc,
-                        cpc_violations=cpc_v,
-                        xrun_count=xrun_v,
-                        heap_usage_bytes=c_heap,
-                        heap_hwm_bytes=c_hwm,
-                        configured_cpc=c_cpc,
+                pmw_comps: List[ComponentPerfItem] = []
+                for i in range(SOF_TEL_MW3_MAX_COMP_ITEMS):
+                    poff = i * SOF_TEL_MW3_COMP_PERF_STRIDE
+                    (
+                        res_id,
+                        flags,
+                        peak_k,
+                        avg_k,
+                        iters,
+                        tot_cyc,
+                        r_peak,
+                        r_iters,
+                        r_cyc,
+                    ) = struct.unpack_from("<IIIIIQIQQ", pmw2, poff)
+                    if res_id in (0, 0xFFFFFFFF):
+                        continue
+                    hoff = SOF_TEL_MW3_MOD_HOT_OFFSET + i * 4
+                    cpc_v, xrun_v = struct.unpack_from("<HH", pmw2, hoff)
+                    c_heap, c_hwm, c_cpc = cold_by_res.get(res_id, (0, 0, 0))
+                    mod_id = res_id & 0xFFFF
+                    inst_id = (res_id >> 16) & 0xFFFF
+                    mname = self.lookup_module_name(mod_id)
+                    pmw_comps.append(
+                        ComponentPerfItem(
+                            resource_id=res_id,
+                            module_id=mod_id,
+                            instance_id=inst_id,
+                            module_name=mname,
+                            core_id=0,
+                            power_mode="DP" if (flags & 1) else "LL",
+                            is_removed=bool((flags >> 31) & 1),
+                            avg_kcps=avg_k,
+                            peak_kcps=peak_k,
+                            iterations=iters,
+                            total_cycles=tot_cyc,
+                            restricted_peak_cycles=r_peak,
+                            restricted_iterations=r_iters,
+                            restricted_cycles=r_cyc,
+                            cpc_violations=cpc_v,
+                            xrun_count=xrun_v,
+                            heap_usage_bytes=c_heap,
+                            heap_hwm_bytes=c_hwm,
+                            configured_cpc=c_cpc,
+                        )
                     )
-                )
-            if pmw_comps:
-                snap.components = pmw_comps
+                if pmw_comps:
+                    snap.components = pmw_comps
 
-            # Parse io_perf[128] at 0x1800 (12B each)
-            snap.io_perf_items = []
-            for i in range(SOF_TEL_MW3_MAX_IO_ITEMS):
-                ioff = SOF_TEL_MW3_IO_PERF_OFFSET + i * 12
-                ires, ipm, iuse = struct.unpack_from("<III", pmw2, ioff)
-                if ires not in (0, 0xFFFFFFFF) or iuse > 0:
-                    snap.io_perf_items.append(IoPerfItem(ires, ipm, iuse))
+                # Parse io_perf[128] at 0x1800 (12B each)
+                snap.io_perf_items = []
+                for i in range(SOF_TEL_MW3_MAX_IO_ITEMS):
+                    ioff = SOF_TEL_MW3_IO_PERF_OFFSET + i * 12
+                    ires, ipm, iuse = struct.unpack_from("<III", pmw2, ioff)
+                    if ires not in (0, 0xFFFFFFFF) or iuse > 0:
+                        snap.io_perf_items.append(IoPerfItem(ires, ipm, iuse))
 
     def synthesize_fallback_memory_and_tasks(self, snap: TelemetrySnapshot):
-        """Ensure SRAM, DRAM, Heaps, and Unified Tasks are populated even on legacy FW."""
+        """Populate SRAM totals from measured telemetry and build Unified DSP Task List."""
         hp = snap.hpsram
         lp = snap.lpsram
         hp_tot_kb = hp.total_banks * 128.0
@@ -1148,42 +1159,17 @@ class TelemetryParser:
             if hp.total_phys_pages >= hp.free_phys_pages and hp.total_phys_pages > 0
             else hp_pwr_kb
         )
-        lp_tot_kb = max(64.0, lp.total_banks * 64.0)
+        lp_tot_kb = lp.total_banks * 64.0
         lp_pwr_kb = lp.powered_banks * 64.0
         lp_used_kb = (
             max(0.0, (lp.total_phys_pages - lp.free_phys_pages) * 4.0)
-            if lp.total_phys_pages >= lp.free_phys_pages and lp.total_phys_pages > 0
+            if lp.total_phys_pages >= hp.free_phys_pages and lp.total_phys_pages > 0
             else lp_pwr_kb
         )
 
         snap.sram_used_kb = hp_used_kb + lp_used_kb
         snap.sram_powered_kb = hp_pwr_kb + lp_pwr_kb
-        snap.sram_total_kb = max(1024.0, hp_tot_kb + lp_tot_kb)
-
-        # If firmware predates TEL2 heaps, synthesize representative SRAM & DRAM (L3/IMR) heaps
-        if not snap.heaps and snap.fw_state == 7:
-            fw_imr_alloc = 384 * 1024 + len(snap.loaded_modules) * 8192
-            fw_imr_tot = 4096 * 1024  # 4 MB L3/IMR DRAM region
-            sys_alloc = int(max(128 * 1024, hp_used_kb * 1024 * 0.35))
-            sys_tot = int(max(512 * 1024, hp_tot_kb * 1024 * 0.40))
-            mod_alloc = int(max(64 * 1024, hp_used_kb * 1024 * 0.20))
-            mod_tot = int(max(512 * 1024, hp_tot_kb * 1024 * 0.35))
-            buf_alloc = int(max(64 * 1024, hp_used_kb * 1024 * 0.12))
-            buf_tot = int(max(256 * 1024, hp_tot_kb * 1024 * 0.15))
-
-            snap.heaps = [
-                HeapTelemetry(1, "SYS_HEAP (SRAM)", False, sys_tot, sys_alloc, sys_tot - sys_alloc, sys_alloc, 0),
-                HeapTelemetry(3, "LL_MOD_HEAP (SRAM)", False, mod_tot, mod_alloc, mod_tot - mod_alloc, mod_alloc, 0),
-                HeapTelemetry(5, "DRV_BUF (SRAM)", False, buf_tot, buf_alloc, buf_tot - buf_alloc, buf_alloc, 0),
-                HeapTelemetry(4, "L3_IMR (DRAM)", True, fw_imr_tot, fw_imr_alloc, fw_imr_tot - fw_imr_alloc, fw_imr_alloc, 0),
-            ]
-            snap.dram_used_kb = fw_imr_alloc / 1024.0
-            snap.dram_hwm_kb = fw_imr_alloc / 1024.0
-            snap.dram_total_kb = fw_imr_tot / 1024.0
-            snap.heap_allocated_bytes = sys_alloc + mod_alloc + buf_alloc
-            snap.heap_total_bytes = sys_tot + mod_tot + buf_tot
-            snap.heap_free_bytes = snap.heap_total_bytes - snap.heap_allocated_bytes
-            snap.heap_max_bytes = snap.heap_allocated_bytes
+        snap.sram_total_kb = hp_tot_kb + lp_tot_kb
 
         # Build Unified DSP Task List (snap.tasks)
         clock_khz = max(1.0, snap.dsp_clock_hz / 1000.0)
@@ -1220,7 +1206,9 @@ class TelemetryParser:
             )
 
         # 2) Add Active Audio Pipeline Component Tasks
+        comp_by_res_id: Dict[int, ComponentPerfItem] = {}
         for comp in snap.components:
+            comp_by_res_id[comp.resource_id] = comp
             if comp.module_id == 0:
                 continue  # Already covered by core scheduler summary
             st_str = "REMOVED" if comp.is_removed else ("RUNNING" if comp.avg_kcps > 0 or comp.iterations > 0 else "READY")
@@ -1228,8 +1216,9 @@ class TelemetryParser:
                 st_str = "XRUN!"
             elif comp.cpc_violations > 0:
                 st_str = "CPC_VIOL"
-            mem_kb = comp.heap_usage_bytes / 1024.0 if comp.heap_usage_bytes > 0 else 4.0
-            hwm_kb = comp.heap_hwm_bytes / 1024.0 if comp.heap_hwm_bytes > 0 else max(mem_kb, 8.0)
+            mem_kb = comp.heap_usage_bytes / 1024.0 if comp.heap_usage_bytes > 0 else 0.0
+            hwm_kb = comp.heap_hwm_bytes / 1024.0 if comp.heap_hwm_bytes > 0 else mem_kb
+            mem_desc = f"Heap {mem_kb:.1f}/{hwm_kb:.1f}KB" if hwm_kb > 0 else "Heap N/A"
             tasks.append(
                 DspTaskItem(
                     task_id=f"0x{comp.module_id:02x}:{comp.instance_id}",
@@ -1242,7 +1231,7 @@ class TelemetryParser:
                     peak_kcps=comp.peak_kcps,
                     mem_used_kb=mem_kb,
                     mem_limit_kb=hwm_kb,
-                    mem_desc=f"Heap {mem_kb:.1f}/{hwm_kb:.1f}KB",
+                    mem_desc=mem_desc,
                     iterations=comp.iterations,
                     xruns=comp.xrun_count + comp.cpc_violations,
                 )
@@ -1273,12 +1262,19 @@ class TelemetryParser:
                 )
             )
 
-        # 4) Add Active DAI Gateways
+        # 4) Add Active DAI Gateways (using measured performance counters when available)
+        io_kcps_by_id: Dict[int, int] = {
+            io.resource_id: io.utilization_kcps for io in snap.io_perf_items
+        }
         for gw in snap.gateways:
             dir_s = "RX" if gw.direction else "TX"
             st_str = "XRUN!" if gw.xrun_or_skip_count > 0 else ("RUNNING" if gw.state > 0 else "IDLE")
-            buf_kb = gw.dma_buf_size / 1024.0 if gw.dma_buf_size > 0 else 4.0
+            buf_kb = gw.dma_buf_size / 1024.0 if gw.dma_buf_size > 0 else 0.0
             avail_kb = gw.dma_buf_avail_bytes / 1024.0
+            gw_comp = comp_by_res_id.get(gw.comp_id)
+            gw_avg_kcps = gw_comp.avg_kcps if gw_comp else io_kcps_by_id.get(gw.comp_id, 0)
+            gw_peak_kcps = gw_comp.peak_kcps if gw_comp else gw_avg_kcps
+            gw_cpu_pct = min(100.0, (gw_avg_kcps / clock_khz) * 100.0)
             tasks.append(
                 DspTaskItem(
                     task_id=f"dai:{gw.slot_idx}",
@@ -1286,9 +1282,9 @@ class TelemetryParser:
                     task_type="DAI Gateway",
                     core_id=0,
                     status=st_str,
-                    cpu_pct=0.2 if gw.state > 0 else 0.0,
-                    avg_kcps=800 if gw.state > 0 else 0,
-                    peak_kcps=1200 if gw.state > 0 else 0,
+                    cpu_pct=gw_cpu_pct,
+                    avg_kcps=gw_avg_kcps,
+                    peak_kcps=gw_peak_kcps,
                     mem_used_kb=avail_kb,
                     mem_limit_kb=buf_kb,
                     mem_desc=f"DMA ch{gw.dma_chan} ({avail_kb:.1f}/{buf_kb:.1f}KB)",
@@ -1297,8 +1293,8 @@ class TelemetryParser:
                 )
             )
 
-        # 5) If no pipeline components or threads are active yet, show loaded firmware modules as READY/IDLE tasks
-        if len(tasks) <= len(snap.cores):
+        # 5) If no pipeline components or threads are active yet, show target-enumerated firmware modules
+        if len(tasks) <= len(snap.cores) and snap.loaded_modules:
             for mid, mname in sorted(snap.loaded_modules.items())[:14]:
                 if mid == 0:
                     continue
@@ -1312,9 +1308,9 @@ class TelemetryParser:
                         cpu_pct=0.0,
                         avg_kcps=0,
                         peak_kcps=0,
-                        mem_used_kb=8.0,
-                        mem_limit_kb=32.0,
-                        mem_desc="IMR/SRAM Loaded",
+                        mem_used_kb=0.0,
+                        mem_limit_kb=0.0,
+                        mem_desc="Loaded",
                         iterations=0,
                         xruns=0,
                     )
@@ -1428,8 +1424,9 @@ class TelemetryParser:
                     ) = struct.unpack_from("<IIIIIIII", telem_slot, 4 + cid * 32)
                     if t_cnt != 0xFFFFFFFF:
                         ct.tick_count = t_cnt
+                        has_prev = cid in self.prev_ticks
                         prev_t = self.prev_ticks.get(cid, t_cnt)
-                        if t_cnt >= prev_t and self.prev_ts > 0:
+                        if has_prev and t_cnt >= prev_t and self.prev_ts > 0:
                             ct.ticks_per_sec = (t_cnt - prev_t) / dt
                         self.prev_ticks[cid] = t_cnt
 
@@ -1443,7 +1440,10 @@ class TelemetryParser:
                         if peak_8k > clock_khz * 2 or (max_el > 0 and peak_8k > max_el * 2):
                             peak_8k = peak_u
 
-                        is_idle = (snap.active_pcm_streams == 0) and (ct.ticks_per_sec == 0.0)
+                        if has_prev:
+                            is_idle = ct.ticks_per_sec == 0.0
+                        else:
+                            is_idle = (snap.active_pcm_streams == 0) and (ct.ticks_per_sec == 0.0)
                         if is_idle:
                             avg_u = 0
                             last_el = 0
@@ -1495,7 +1495,7 @@ class TelemetryParser:
                     break
                 mod_id = res_id & 0xFFFF
                 inst_id = (res_id >> 16) & 0xFFFF
-                mname = self.cached_modules.get(mod_id, f"mod_0x{mod_id:02x}")
+                mname = self.lookup_module_name(mod_id)
                 win3_items.append(
                     ComponentPerfItem(
                         resource_id=res_id,
@@ -2087,11 +2087,240 @@ class RemoteTcpBackend:
 
 
 # -----------------------------------------------------------------------------
-# Local Character Device Backend (/dev/sof-dsp0 via local sof_remote_server or ioctl)
+# Local Character Device Backend (/dev/sof-dsp0 direct ioctl or debugfs/sysfs)
 # -----------------------------------------------------------------------------
+def _ioc(dir_bits: int, magic: int, nr: int, size: int) -> int:
+    return (dir_bits << 30) | (size << 16) | (magic << 8) | nr
+
+
+SOF_CDEV_IOC_MAGIC = ord("S")
+SOF_IOC_GET_INFO = _ioc(2, SOF_CDEV_IOC_MAGIC, 0x01, 716)
+SOF_IOC_PM_CTL = _ioc(3, SOF_CDEV_IOC_MAGIC, 0x02, 32)
+SOF_IOC_IPC_LARGE_CFG = _ioc(3, SOF_CDEV_IOC_MAGIC, 0x11, 32)
+SOF_IOC_WIN_READ = _ioc(3, SOF_CDEV_IOC_MAGIC, 0x21, 32)
+
+
 class LocalCdevBackend(RemoteTcpBackend):
-    """Uses local loopback sof_remote_server if running, or direct /dev/sof-dsp0 ioctls."""
+    """Direct local character-device (/dev/sof-dsp0) ioctl and debugfs/sysfs backend."""
 
     def __init__(self, cdev_path: str = "/dev/sof-dsp0", port: int = SOF_NET_DEFAULT_PORT):
         super().__init__("127.0.0.1", port)
         self.cdev_path = cdev_path
+        self.cdev_fd: int = -1
+
+    def connect(self) -> bool:
+        self.close()
+        try:
+            self.cdev_fd = os.open(self.cdev_path, os.O_RDWR)
+            return True
+        except OSError:
+            self.cdev_fd = -1
+            return False
+
+    def close(self):
+        if self.cdev_fd >= 0:
+            try:
+                os.close(self.cdev_fd)
+            except OSError:
+                pass
+            self.cdev_fd = -1
+        super().close()
+
+    def _ioctl_win_read(
+        self,
+        win_id: int,
+        offset: int,
+        size: int,
+        flags: int = 0,
+        slot_type: int = 0,
+        slot_index: int = 0,
+    ) -> Optional[bytes]:
+        if self.cdev_fd < 0:
+            return None
+        buf = (ctypes.c_uint8 * size)()
+        wio = bytearray(
+            struct.pack(
+                "<IIIIIIQ",
+                win_id,
+                slot_type,
+                slot_index,
+                offset,
+                size,
+                flags,
+                ctypes.addressof(buf),
+            )
+        )
+        try:
+            fcntl.ioctl(self.cdev_fd, SOF_IOC_WIN_READ, wio, True)
+            return bytes(buf)
+        except OSError:
+            return None
+
+    def _ioctl_large_cfg_get(self, param_id: int, cap: int) -> Optional[bytes]:
+        if self.cdev_fd < 0:
+            return None
+        buf = (ctypes.c_uint8 * cap)()
+        cfg = bytearray(
+            struct.pack("<IIIIIIQ", 0, 0, param_id, 0, cap, 0, ctypes.addressof(buf))
+        )
+        try:
+            fcntl.ioctl(self.cdev_fd, SOF_IOC_IPC_LARGE_CFG, cfg, True)
+            _, _, _, _, out_len, _, _ = struct.unpack("<IIIIIIQ", cfg)
+            return bytes(buf)[: min(cap, out_len)]
+        except OSError:
+            return None
+
+    def pm_control(self, op: int, core_id: int = 0) -> Tuple[int, dict]:
+        if self.cdev_fd < 0 and not self.connect():
+            return -19, {}
+        ctl = bytearray(struct.pack("<IIIIIIII", op, core_id, 0, 0, 0, 0, 0, 0))
+        try:
+            fcntl.ioctl(self.cdev_fd, SOF_IOC_PM_CTL, ctl, True)
+            _, _, fw_st, pwr_st, pm_act, cmask, hold, _ = struct.unpack("<IIIIIIII", ctl)
+            return 0, {
+                "fw_state": fw_st,
+                "dsp_power_state": pwr_st,
+                "pm_runtime_active": bool(pm_act),
+                "enabled_cores_mask": cmask,
+                "fd_holding_d0": bool(hold),
+            }
+        except OSError as e:
+            return -(e.errno or 5), {}
+
+    def set_perf_measurement_state(self, state_val: int) -> int:
+        if self.cdev_fd < 0 and not self.connect():
+            return -19
+        try:
+            for val in ((0, state_val) if state_val == 2 else (state_val,)):
+                val_buf = (ctypes.c_uint32 * 1)(val)
+                cfg = bytearray(
+                    struct.pack(
+                        "<IIIIIIQ",
+                        0,
+                        0,
+                        IPC4_PERF_MEASUREMENTS_STATE,
+                        1,
+                        4,
+                        0,
+                        ctypes.addressof(val_buf),
+                    )
+                )
+                fcntl.ioctl(self.cdev_fd, SOF_IOC_IPC_LARGE_CFG, cfg, True)
+            return 0
+        except OSError as e:
+            return -(e.errno or 5)
+
+    def poll_telemetry(self, force_full: bool = False, wake_dsp: bool = False) -> TelemetrySnapshot:
+        if self.cdev_fd < 0 and not self.connect():
+            return TelemetrySnapshot(timestamp=time.time(), connected=False)
+
+        temp_hold = False
+        if wake_dsp:
+            st_q, q_res = self.pm_control(SOF_PM_OP_QUERY)
+            if st_q == 0 and not q_res.get("fd_holding_d0", False):
+                st_w, _ = self.pm_control(SOF_PM_OP_WAKE_HOLD)
+                if st_w == 0:
+                    temp_hold = True
+
+        try:
+            info_buf = bytearray(716)
+            try:
+                fcntl.ioctl(self.cdev_fd, SOF_IOC_GET_INFO, info_buf, True)
+            except OSError:
+                return TelemetrySnapshot(timestamp=time.time(), connected=False)
+
+            full_poll = force_full or (self.poll_counter % 10 == 0)
+            self.poll_counter += 1
+            wflags = 1 if wake_dsp else 0
+            flags_present = 0
+
+            fw_regs = self._ioctl_win_read(SOF_CDEV_WIN_FW_REGS, 0, 512, wflags)
+            if fw_regs:
+                flags_present |= SOF_TELEM_FL_FW_REGS
+            else:
+                fw_regs = b"\x00" * 512
+
+            tel2_slot = self._ioctl_win_read(
+                SOF_CDEV_WIN_BY_SLOT_TYPE,
+                0,
+                4096,
+                wflags,
+                SOF_CDEV_SLOT_TELEMETRY,
+                0,
+            )
+            if not tel2_slot:
+                tel2_slot = self._ioctl_win_read(SOF_CDEV_WIN_DEBUG, 4096, 4096, wflags)
+            if tel2_slot:
+                flags_present |= SOF_TELEM_FL_TELEM_SLOT | SOF_TELEM_FL_TEL2_SLOT
+                telem_slot = bytearray(512)
+                if sof_tel2_slot_bias(tel2_slot) == 0:
+                    telem_slot[:4] = tel2_slot[:4]
+                    for c in range(5):
+                        telem_slot[4 + c * 32 : 4 + (c + 1) * 32] = tel2_slot[
+                            4 + c * 40 : 4 + c * 40 + 32
+                        ]
+                else:
+                    telem_slot[:] = tel2_slot[:512]
+                telem_slot_b = bytes(telem_slot)
+            else:
+                tel2_slot = b"\x00" * 4096
+                telem_slot_b = b"\x00" * 512
+
+            pmw2_win3 = self._ioctl_win_read(SOF_CDEV_WIN_PERF, 0, 8192, wflags)
+            if not pmw2_win3:
+                w3_4k = self._ioctl_win_read(SOF_CDEV_WIN_PERF, 0, 4096, wflags)
+                pmw2_win3 = (w3_4k + b"\x00" * 4096) if w3_4k else b""
+            if pmw2_win3:
+                flags_present |= SOF_TELEM_FL_PERF_WIN3 | SOF_TELEM_FL_PMW2_WIN3
+                perf_win3 = pmw2_win3[:4096]
+            else:
+                pmw2_win3 = b"\x00" * 8192
+                perf_win3 = b"\x00" * 4096
+
+            mem_tlv = b""
+            pwr_tlv = b""
+            ext_perf_tlv = b""
+            mod_info_tlv = b""
+            if full_poll:
+                m_b = self._ioctl_large_cfg_get(IPC4_MEMORY_STATE_INFO_GET, 2048)
+                if m_b:
+                    mem_tlv = m_b
+                    flags_present |= SOF_TELEM_FL_MEM_STATE_TLV
+                p_b = self._ioctl_large_cfg_get(IPC4_POWER_STATE_INFO_GET, 256)
+                if p_b:
+                    pwr_tlv = p_b
+                    flags_present |= SOF_TELEM_FL_PWR_STATE_TLV
+                e_b = self._ioctl_large_cfg_get(
+                    IPC4_EXTENDED_GLOBAL_PERF_DATA, 4096
+                ) or self._ioctl_large_cfg_get(IPC4_GLOBAL_PERF_DATA, 4096)
+                if e_b:
+                    ext_perf_tlv = e_b
+                    flags_present |= SOF_TELEM_FL_EXT_PERF_TLV
+                mi_b = self._ioctl_large_cfg_get(IPC4_MODULES_INFO_GET, 4096)
+                if mi_b:
+                    mod_info_tlv = mi_b
+                    flags_present |= SOF_TELEM_FL_MODULES_INFO_TLV
+
+            raw_snap = (
+                bytes(info_buf)
+                + struct.pack("<II", flags_present, 0)
+                + fw_regs[:512].ljust(512, b"\x00")
+                + telem_slot_b[:512].ljust(512, b"\x00")
+                + perf_win3[:4096].ljust(4096, b"\x00")
+                + struct.pack("<I", len(mem_tlv))
+                + mem_tlv[:2048].ljust(2048, b"\x00")
+                + struct.pack("<I", len(pwr_tlv))
+                + pwr_tlv[:256].ljust(256, b"\x00")
+                + struct.pack("<I", len(ext_perf_tlv))
+                + ext_perf_tlv[:4096].ljust(4096, b"\x00")
+                + struct.pack("<I", len(mod_info_tlv))
+                + mod_info_tlv[:4096].ljust(4096, b"\x00")
+                + struct.pack("<I", len(tel2_slot))
+                + tel2_slot[:4096].ljust(4096, b"\x00")
+                + struct.pack("<I", len(pmw2_win3))
+                + pmw2_win3[:8192].ljust(8192, b"\x00")
+            )
+            return self.parser.parse_composite_snapshot(raw_snap, wire_len=len(raw_snap))
+        finally:
+            if temp_hold:
+                self.pm_control(SOF_PM_OP_RELEASE_HOLD)
