@@ -514,8 +514,75 @@ static int read_debugfs_fw_state(void)
 	return -1;
 }
 
+static int get_sof_card_index(void)
+{
+	discover_sof_pci_device();
+
+	/* 1. Check /sys/bus/pci/devices/<bdf>/sound/card* */
+	if (g_hw_ctx.found && g_hw_ctx.bdf[0] != '\0') {
+		char snd_path[256];
+		snprintf(snd_path, sizeof(snd_path),
+			 "/sys/bus/pci/devices/%s/sound", g_hw_ctx.bdf);
+		DIR *sd = opendir(snd_path);
+		if (sd) {
+			struct dirent *de;
+			unsigned int idx = 0;
+			while ((de = readdir(sd)) != NULL) {
+				if (sscanf(de->d_name, "card%u", &idx) == 1) {
+					closedir(sd);
+					return (int)idx;
+				}
+			}
+			closedir(sd);
+		}
+	}
+
+	/* 2. Check /sys/class/sound/card* device symlink for BDF or "sof" */
+	DIR *cd = opendir("/sys/class/sound");
+	if (cd) {
+		struct dirent *de;
+		unsigned int idx = 0;
+		while ((de = readdir(cd)) != NULL) {
+			if (sscanf(de->d_name, "card%u", &idx) != 1)
+				continue;
+			char dev_link[256], resolved[512];
+			snprintf(dev_link, sizeof(dev_link),
+				 "/sys/class/sound/%s/device", de->d_name);
+			if (realpath(dev_link, resolved)) {
+				if ((g_hw_ctx.found && g_hw_ctx.bdf[0] != '\0' &&
+				     strstr(resolved, g_hw_ctx.bdf) != NULL) ||
+				    strstr(resolved, "sof") != NULL) {
+					closedir(cd);
+					return (int)idx;
+				}
+			}
+		}
+		closedir(cd);
+	}
+
+	/* 3. Fallback: scan /proc/asound/cards for an SOF card */
+	FILE *fp = fopen("/proc/asound/cards", "r");
+	if (fp) {
+		char line[256];
+		while (fgets(line, sizeof(line), fp)) {
+			unsigned int idx = 0;
+			if (sscanf(line, " %u [", &idx) == 1 &&
+			    (strstr(line, "sof-") != NULL || strstr(line, "SOF") != NULL)) {
+				fclose(fp);
+				return (int)idx;
+			}
+		}
+		fclose(fp);
+	}
+	return -1;
+}
+
 static void trigger_on_demand_dsp_boot(void)
 {
+	int sof_card = get_sof_card_index();
+	if (sof_card < 0)
+		return;
+
 	FILE *fp = fopen("/proc/asound/pcm", "r");
 	if (!fp)
 		return;
@@ -526,7 +593,8 @@ static void trigger_on_demand_dsp_boot(void)
 
 	while (fgets(line, sizeof(line), fp)) {
 		unsigned int c = 0, d = 0;
-		if (sscanf(line, "%u-%u:", &c, &d) == 2) {
+		if (sscanf(line, "%u-%u:", &c, &d) == 2 &&
+		    c == (unsigned int)sof_card) {
 			if (strstr(line, "capture")) {
 				card = c;
 				dev = d;
@@ -585,6 +653,28 @@ static bool sysfs_pm_is_active(void)
 	return false;
 }
 
+static int sysfs_pm_get_control(char *out, size_t cap)
+{
+	if (!out || cap == 0)
+		return -EINVAL;
+	out[0] = '\0';
+	discover_sof_pci_device();
+	if (!g_hw_ctx.found)
+		return -ENODEV;
+	FILE *fp = fopen(g_hw_ctx.pm_control_path, "r");
+	if (!fp)
+		return -errno;
+	if (!fgets(out, (int)cap, fp)) {
+		fclose(fp);
+		return -EIO;
+	}
+	fclose(fp);
+	size_t len = strlen(out);
+	while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r'))
+		out[--len] = '\0';
+	return 0;
+}
+
 static int sysfs_pm_set_control(const char *mode, bool hold_flag)
 {
 	discover_sof_pci_device();
@@ -597,7 +687,10 @@ static int sysfs_pm_set_control(const char *mode, bool hold_flag)
 	int err = (n < 0) ? -errno : 0;
 	close(fd);
 	if (err == 0) {
-		g_hw_ctx.holding_d0 = hold_flag;
+		if (hold_flag)
+			g_hw_ctx.holding_d0 = true;
+		else if (strcmp(mode, "auto") == 0)
+			g_hw_ctx.holding_d0 = false;
 		if (strcmp(mode, "on") == 0) {
 			/* Wait up to 100ms for runtime_status == active */
 			for (int i = 0; i < 20 && !sysfs_pm_is_active(); i++)
@@ -828,10 +921,22 @@ static int populate_direct_cdev_info(struct sof_cdev_info *info)
 	}
 
 	if (info->fw_state == 7) {
-		info->fw_ver_major = 2;
-		info->fw_ver_minor = 14;
-		info->fw_ver_micro = 99;
-		info->fw_ver_build = 1;
+		FILE *vfp = fopen("/sys/kernel/debug/sof/fw_version", "r");
+		if (vfp) {
+			unsigned int maj = 0, min = 0, mic = 0, bld = 0;
+			char vline[128];
+			while (fgets(vline, sizeof(vline), vfp)) {
+				if (sscanf(vline, "%u.%u.%u.%u", &maj, &min, &mic, &bld) >= 3 ||
+				    sscanf(vline, "version: %u.%u.%u.%u", &maj, &min, &mic, &bld) >= 3) {
+					info->fw_ver_major = (uint16_t)maj;
+					info->fw_ver_minor = (uint16_t)min;
+					info->fw_ver_micro = (uint16_t)mic;
+					info->fw_ver_build = (uint16_t)bld;
+					break;
+				}
+			}
+			fclose(vfp);
+		}
 	}
 
 	if (info->pm_runtime_active && info->fw_state == 7) {
@@ -978,7 +1083,13 @@ static int read_file_first_line(const char *path, char *out, size_t cap)
 static uint32_t count_running_alsa_substreams(void)
 {
 	uint32_t running = atomic_load_explicit(&g_tone_running, memory_order_acquire) ? 1U : 0U;
-	DIR *card_dir = opendir("/proc/asound/card0");
+	int sof_card = get_sof_card_index();
+	if (sof_card < 0)
+		return running;
+
+	char card_path[128];
+	snprintf(card_path, sizeof(card_path), "/proc/asound/card%d", sof_card);
+	DIR *card_dir = opendir(card_path);
 	if (!card_dir)
 		return running;
 
@@ -986,18 +1097,30 @@ static uint32_t count_running_alsa_substreams(void)
 	while ((de = readdir(card_dir)) != NULL) {
 		if (strncmp(de->d_name, "pcm", 3) != 0)
 			continue;
-		char st_path[320];
-		snprintf(st_path, sizeof(st_path),
-			 "/proc/asound/card0/%s/sub0/status", de->d_name);
-		char buf[128];
-		if (read_file_first_line(st_path, buf, sizeof(buf)) == 0 &&
-		    strstr(buf, "RUNNING") != NULL)
-			running++;
+		char pcm_path[256];
+		snprintf(pcm_path, sizeof(pcm_path), "%s/%s", card_path, de->d_name);
+		DIR *pcm_dir = opendir(pcm_path);
+		if (!pcm_dir)
+			continue;
+		struct dirent *sde;
+		while ((sde = readdir(pcm_dir)) != NULL) {
+			if (strncmp(sde->d_name, "sub", 3) != 0)
+				continue;
+			char st_path[384];
+			snprintf(st_path, sizeof(st_path),
+				 "%s/%s/status", pcm_path, sde->d_name);
+			char buf[128];
+			if (read_file_first_line(st_path, buf, sizeof(buf)) == 0 &&
+			    strstr(buf, "RUNNING") != NULL)
+				running++;
+		}
+		closedir(pcm_dir);
 	}
 	closedir(card_dir);
 	return running;
 }
 
+static pthread_mutex_t g_fw_mods_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t g_cached_fw_mods_tlv[4096];
 static uint32_t g_cached_fw_mods_len;
 static bool g_cached_fw_mods_loaded;
@@ -1007,8 +1130,8 @@ static void synthesize_modules_info_from_fw(struct sof_net_telem_snapshot *snap)
 	if (snap->flags_present & SOF_TELEM_FL_MODULES_INFO_TLV)
 		return;
 
+	pthread_mutex_lock(&g_fw_mods_lock);
 	if (!g_cached_fw_mods_loaded) {
-		g_cached_fw_mods_loaded = true;
 		char fw_dir[128] = "intel/sof-ipc4/ptl/community";
 		char fw_name[64] = "sof-ptl.ri";
 		read_file_first_line("/sys/kernel/debug/sof/fw_profile/fw_path",
@@ -1043,8 +1166,14 @@ static void synthesize_modules_info_from_fw(struct sof_net_telem_snapshot *snap)
 						if (memcmp(fw_buf + pos, "$AME", 4) == 0 &&
 						    fw_buf[pos + 4] >= 'A' && fw_buf[pos + 4] <= 'Z') {
 							if (out_off + 116 <= sizeof(g_cached_fw_mods_tlv)) {
+								uint16_t rt_mod_id = (uint16_t)mod_cnt;
+								uint16_t rt_state = 2U; /* MODULE_INITIALIZED */
 								memcpy(g_cached_fw_mods_tlv + out_off,
 								       fw_buf + pos, 116);
+								memcpy(g_cached_fw_mods_tlv + out_off,
+								       &rt_mod_id, 2);
+								memcpy(g_cached_fw_mods_tlv + out_off + 2,
+								       &rt_state, 2);
 								out_off += 116;
 								mod_cnt++;
 							}
@@ -1060,6 +1189,7 @@ static void synthesize_modules_info_from_fw(struct sof_net_telem_snapshot *snap)
 			}
 			fclose(fp);
 		}
+		g_cached_fw_mods_loaded = true;
 	}
 
 	if (g_cached_fw_mods_len > 0 &&
@@ -1069,16 +1199,20 @@ static void synthesize_modules_info_from_fw(struct sof_net_telem_snapshot *snap)
 		snap->modules_info_len = g_cached_fw_mods_len;
 		snap->flags_present |= SOF_TELEM_FL_MODULES_INFO_TLV;
 	}
+	pthread_mutex_unlock(&g_fw_mods_lock);
 }
 
-static uint32_t g_prev_core_ticks[SOF_TEL_MAX_CORES];
-static bool g_has_prev_core_ticks;
+struct client_telem_state {
+	uint32_t prev_core_ticks[SOF_TEL_MAX_CORES];
+	bool     has_prev_core_ticks;
+};
 
 /*
  * Synthesize IPC4 TLVs (ext_perf_tlv, pwr_state_tlv, mem_state_tlv) directly from
  * TEL2 (MW2 Slot 1) and PMW2 (MW3) when /dev/sof-dsp0 IPC ioctls are unavailable.
  */
-static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap)
+static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
+					 struct client_telem_state *tstate)
 {
 	const uint8_t *t2 = snap->tel2_slot;
 	uint8_t *w3 = snap->pmw2_win3;
@@ -1108,9 +1242,12 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap)
 			if (t_cnt == 0xFFFFFFFFU)
 				continue;
 
-			bool ticking = (snap->active_pcm_streams > 0) ||
-				       (g_has_prev_core_ticks && t_cnt != g_prev_core_ticks[c]);
-			g_prev_core_ticks[c] = t_cnt;
+			bool ticking;
+			if (tstate->has_prev_core_ticks)
+				ticking = (t_cnt != tstate->prev_core_ticks[c]);
+			else
+				ticking = (snap->active_pcm_streams > 0 && t_cnt > 0);
+			tstate->prev_core_ticks[c] = t_cnt;
 
 			if (max_el > 400000U)
 				max_el = (last_el <= 400000U) ? last_el : 0U;
@@ -1137,7 +1274,7 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap)
 			st32[6] = p4k_u;
 			st32[7] = p8k_u;
 		}
-		g_has_prev_core_ticks = true;
+		tstate->has_prev_core_ticks = true;
 	}
 
 	/* 1. Synthesize pwr_state_tlv & enabled_cores_mask from TEL2 */
@@ -1172,7 +1309,7 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap)
 		snap->flags_present |= SOF_TELEM_FL_PWR_STATE_TLV;
 	}
 
-	/* 2. Synthesize mem_state_tlv from TEL2 mem_sec.sram (or platform fallback) */
+	/* 2. Synthesize mem_state_tlv only when TEL2 mem_sec.sram is present */
 	if (!(snap->flags_present & SOF_TELEM_FL_MEM_STATE_TLV)) {
 		uint32_t hp_tot_pages = 0, hp_free_pages = 0, hp_banks = 0;
 		uint32_t pgctl[3] = { 0xFFFFFFFFU, 0xFFFFFFFFU, 0xFFFFFFFFU };
@@ -1194,17 +1331,6 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap)
 			lp_free_pages = ms->sram.lp_sram_free_pages;
 			lp_banks = (lp_tot_pages + 15U) / 16U;
 			lp_pgctl = ~ms->sram.lpsram_ebb_mask;
-		} else if (snap->dev_info.fw_state == 7 &&
-			   (snap->flags_present & SOF_TELEM_FL_TELEM_SLOT)) {
-			hp_banks = (snap->dev_info.hw_ip_version >= 6) ? 24U : 40U;
-			hp_tot_pages = hp_banks * 16U;
-			hp_free_pages = (hp_banks - 8U) * 16U;
-			pgctl[0] = ~0x000000FFU; /* 8 HPSRAM banks powered */
-			/* LPSRAM (sram1 at 0xa0000000, 64 KB = 1 bank): unused in Zephyr SOF */
-			lp_banks = 1U;
-			lp_tot_pages = 16U;
-			lp_free_pages = 16U;
-			lp_pgctl = 0xFFFFFFFFU; /* 0 LPSRAM banks powered/used */
 		}
 
 		if (hp_banks > 0 && hp_banks <= 96) {
@@ -1241,7 +1367,7 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap)
 				memcpy(snap->mem_state_tlv + off, &lp_pgctl, 4); off += 4;
 				memcpy(snap->mem_state_tlv + off, &lp_banks, 4); off += 4;
 				uint32_t lp_used = (lp_tot_pages >= lp_free_pages) ?
-						   ((lp_tot_pages - lp_free_pages + 15U) / 16U) : 1U;
+						   ((lp_tot_pages - lp_free_pages + 15U) / 16U) : 0U;
 				for (uint32_t b = 0; b < lp_banks; b++) {
 					uint16_t amask = (b < lp_used) ? 0xFFFFU : 0x0000U;
 					memcpy(snap->mem_state_tlv + off, &amask, 2);
@@ -1288,22 +1414,9 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap)
 			count++;
 		}
 
-		/* Count active component items in MW3 perf_data */
-		uint32_t active_comp_cnt = 0;
-		for (uint32_t i = 0; i < SOF_TEL_MW3_MAX_COMP_ITEMS; i++) {
-			const uint8_t *p = w3 + i * 48U;
-			uint32_t res_id = *(const uint32_t *)(p + 0);
-			if (res_id != 0 && res_id != 0xFFFFFFFFU)
-				active_comp_cnt++;
-		}
-		const uint32_t *c0_st = (const uint32_t *)(snap->telem_slot + 4);
-		uint32_t c0_ticks = c0_st[0];
-		uint32_t c0_avg_k = (c0_st[4] <= 800000U) ? c0_st[4] : 0U;
-		uint32_t c0_peak_k = (c0_st[5] <= 800000U) ? c0_st[5] : c0_avg_k;
-
-		/* Add active component items from MW3 perf_data (48-byte DSP stride) */
+		/* Add component items from MW3 perf_data (48-byte DSP stride) preserving FW state */
 		for (uint32_t i = 0; i < SOF_TEL_MW3_MAX_COMP_ITEMS && count < max_out; i++) {
-			uint8_t *p = w3 + i * 48U;
+			const uint8_t *p = w3 + i * 48U;
 			uint32_t res_id = *(const uint32_t *)(p + 0);
 			uint32_t flags  = *(const uint32_t *)(p + 4);
 			uint32_t peak_k = *(const uint32_t *)(p + 8);
@@ -1316,24 +1429,6 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap)
 				continue;
 			if (res_id == 0)
 				continue; /* Skip duplicate core 0 entry */
-
-			/*
-			 * When an ALSA PCM stream is actively running on a system without
-			 * /dev/sof-dsp0 (where IPC4_PERF_MEASUREMENTS_STATE cannot be set),
-			 * helper.c leaves stale is_removed=1 and avg_k=0 on re-opened slots.
-			 */
-			if (snap->active_pcm_streams > 0 && avg_k == 0 && active_comp_cnt > 0) {
-				flags &= ~0x80000000U;
-				avg_k = (c0_avg_k > 0) ? (c0_avg_k / (active_comp_cnt + 1U)) : 1200U;
-				peak_k = (c0_peak_k > 0) ? (c0_peak_k / (active_comp_cnt + 1U)) : 1800U;
-				iters = c0_ticks;
-				tot_c = (uint64_t)avg_k * (uint64_t)iters;
-				memcpy(p + 4, &flags, 4);
-				memcpy(p + 8, &peak_k, 4);
-				memcpy(p + 12, &avg_k, 4);
-				memcpy(p + 16, &iters, 4);
-				memcpy(p + 20, &tot_c, 8);
-			}
 
 			out_items[count].resource_id = res_id;
 			out_items[count].power_mode = flags & 1U;
@@ -1353,7 +1448,8 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap)
 }
 
 static int handle_telem_snapshot(int sock, int cdev_fd, uint32_t req_id,
-				 const uint8_t *req_buf, uint32_t req_len)
+				 const uint8_t *req_buf, uint32_t req_len,
+				 struct client_telem_state *tstate)
 {
 	struct sof_net_telem_req req = {
 		.query_mask = SOF_TELEM_FL_FW_REGS |
@@ -1383,6 +1479,7 @@ static int handle_telem_snapshot(int sock, int cdev_fd, uint32_t req_id,
 
 	bool temp_hold = false;
 	bool temp_sysfs_hold = false;
+	char prior_sysfs_ctl[32] = "auto";
 	if (req.flags & SOF_TELEM_FL_WAKE_DSP) {
 		if (cdev_fd >= 0) {
 			struct sof_cdev_pm_ctl pm_q = { .op = SOF_PM_OP_QUERY };
@@ -1391,8 +1488,13 @@ static int handle_telem_snapshot(int sock, int cdev_fd, uint32_t req_id,
 				if (ioctl(cdev_fd, SOF_IOC_PM_CTL, &pm_w) == 0)
 					temp_hold = true;
 			}
-		} else if (!sysfs_pm_is_active() || read_debugfs_fw_state() == 2) {
-			sysfs_pm_set_control("on", true);
+		} else if (!g_hw_ctx.holding_d0) {
+			sysfs_pm_get_control(prior_sysfs_ctl, sizeof(prior_sysfs_ctl));
+			if (!sysfs_pm_is_active() || read_debugfs_fw_state() == 2) {
+				if (sysfs_pm_set_control("on", false) == 0 &&
+				    strcmp(prior_sysfs_ctl, "on") != 0)
+					temp_sysfs_hold = true;
+			}
 		}
 	}
 
@@ -1407,8 +1509,8 @@ static int handle_telem_snapshot(int sock, int cdev_fd, uint32_t req_id,
 			struct sof_cdev_pm_ctl pm_r = { .op = SOF_PM_OP_RELEASE_HOLD };
 			ioctl(cdev_fd, SOF_IOC_PM_CTL, &pm_r);
 		}
-		if (temp_sysfs_hold)
-			sysfs_pm_set_control("auto", false);
+		if (temp_sysfs_hold && !g_hw_ctx.holding_d0)
+			sysfs_pm_set_control(prior_sysfs_ctl[0] ? prior_sysfs_ctl : "auto", false);
 		free(snap);
 		return send_reply(sock, SOF_NET_OP_TELEM_SNAPSHOT, req_id,
 				  info_rc, NULL, 0);
@@ -1567,7 +1669,7 @@ static int handle_telem_snapshot(int sock, int cdev_fd, uint32_t req_id,
 		}
 
 		/* Synthesize any missing TLVs from TEL2 and PMW2 windows */
-		synthesize_tlvs_from_windows(snap);
+		synthesize_tlvs_from_windows(snap, tstate);
 		if (hot_only) {
 			snap->mem_state_len = 0;
 			memset(snap->mem_state_tlv, 0, sizeof(snap->mem_state_tlv));
@@ -1587,8 +1689,8 @@ static int handle_telem_snapshot(int sock, int cdev_fd, uint32_t req_id,
 		struct sof_cdev_pm_ctl pm_r = { .op = SOF_PM_OP_RELEASE_HOLD };
 		ioctl(cdev_fd, SOF_IOC_PM_CTL, &pm_r);
 	}
-	if (temp_sysfs_hold)
-		sysfs_pm_set_control("auto", false);
+	if (temp_sysfs_hold && !g_hw_ctx.holding_d0)
+		sysfs_pm_set_control(prior_sysfs_ctl[0] ? prior_sysfs_ctl : "auto", false);
 
 	uint32_t send_sz = (req.query_mask & (SOF_TELEM_FL_TEL2_SLOT | SOF_TELEM_FL_PMW2_WIN3)) ?
 			   (uint32_t)sizeof(*snap) : SOF_NET_TELEM_SNAPSHOT_V1_SIZE;
@@ -1727,6 +1829,7 @@ static void *client_worker_fn(void *arg)
 	int cdev_fd = open(g_cdev_path, O_RDWR);
 	if (cdev_fd < 0)
 		discover_sof_pci_device();
+	struct client_telem_state tstate = {0};
 
 	while (g_running) {
 		struct sof_net_hdr hdr;
@@ -2025,7 +2128,8 @@ static void *client_worker_fn(void *arg)
 
 		case SOF_NET_OP_TELEM_SNAPSHOT:
 			rc = handle_telem_snapshot(sock, cdev_fd, hdr.req_id,
-						   req_buf, hdr.payload_len);
+						   req_buf, hdr.payload_len,
+						   &tstate);
 			break;
 
 		case SOF_NET_OP_LLEXT_LOAD: {

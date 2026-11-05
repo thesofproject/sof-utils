@@ -19,6 +19,7 @@ Usage:
 import argparse
 import os
 import sys
+import threading
 import time
 
 # Ensure imports resolve from the directory containing sof-top even when invoked via symlink
@@ -38,11 +39,12 @@ import cairo
 from backend import (
     RemoteTcpBackend,
     LocalCdevBackend,
+    TelemetrySnapshot,
     SOF_PM_OP_WAKE_HOLD,
     SOF_PM_OP_RELEASE_HOLD,
     SOF_PM_OP_BOOT_DSP,
 )
-from widgets_cairo import UserDashboardCairoWidget
+from widgets_cairo import UserDashboardCairoWidget, UserDashboardRenderer
 
 
 DARK_CSS = b"""
@@ -104,6 +106,9 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         self.set_default_size(1440, 880)
         self.args = args
         self.backend = None
+        self.io_lock = threading.Lock()
+        self.poll_in_flight = False
+        self.perf_meas_initialized = False
         self.poll_timer_id = None
         self.poll_interval_ms = args.interval
         self.wake_on_poll = args.wake
@@ -188,6 +193,14 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
             b.connect("clicked", self._on_set_poll_rate, ms)
             toolbar.append(b)
 
+        toolbar.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        btn_pgup = Gtk.Button(label="Tasks ▲")
+        btn_pgup.connect("clicked", lambda _: self.dashboard.scroll_tasks(-6))
+        toolbar.append(btn_pgup)
+        btn_pgdn = Gtk.Button(label="Tasks ▼")
+        btn_pgdn.connect("clicked", lambda _: self.dashboard.scroll_tasks(6))
+        toolbar.append(btn_pgdn)
+
         self.dashboard = UserDashboardCairoWidget()
         root_box.append(self.dashboard)
 
@@ -197,34 +210,50 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         root_box.append(self.status_label)
 
     def _connect_backend(self, target: str):
-        if self.backend:
-            try:
-                self.backend.close()
-            except Exception:
-                pass
-            self.backend = None
+        self._set_status(f"Connecting to {target}...")
 
-        try:
-            if target.startswith("/") or target.startswith("local:"):
-                dev_path = target.split("local:", 1)[-1] if target.startswith("local:") else target
-                self.backend = LocalCdevBackend(dev_path, self.args.port)
-            else:
-                if ":" in target:
-                    host, port_s = target.rsplit(":", 1)
-                    port = int(port_s)
-                else:
-                    host, port = target, self.args.port
-                self.backend = RemoteTcpBackend(host, port)
-            if self.backend.connect():
-                self._set_status(f"Connected to {target}")
-                self._poll_once(True)
-            else:
-                self._set_status(f"Failed to connect to {target}")
-        except Exception as e:
-            self._set_status(f"Connection to '{target}' failed: {e}")
+        def _worker():
+            with self.io_lock:
+                if self.backend:
+                    try:
+                        self.backend.close()
+                    except Exception:
+                        pass
+                    self.backend = None
+                self.perf_meas_initialized = False
+
+                try:
+                    if target.startswith("/") or target.startswith("local:"):
+                        dev_path = (
+                            target.split("local:", 1)[-1]
+                            if target.startswith("local:")
+                            else target
+                        )
+                        new_be = LocalCdevBackend(dev_path, self.args.port)
+                    else:
+                        if ":" in target:
+                            host, port_s = target.rsplit(":", 1)
+                            port = int(port_s)
+                        else:
+                            host, port = target, self.args.port
+                        new_be = RemoteTcpBackend(host, port)
+                    ok = new_be.connect()
+                    self.backend = new_be
+                    if ok:
+                        GLib.idle_add(self._set_status, f"Connected to {target}")
+                        self._poll_once_Async(True)
+                    else:
+                        GLib.idle_add(self._set_status, f"Failed to connect to {target}")
+                except Exception as e:
+                    GLib.idle_add(
+                        self._set_status, f"Connection to '{target}' failed: {e}"
+                    )
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _set_status(self, msg: str):
         self.status_label.set_text(msg)
+        return False
 
     def _on_poll_tick(self) -> bool:
         if self.poll_interval_ms <= 0:
@@ -233,46 +262,86 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         return True
 
     def _poll_once(self, force_full: bool = False) -> bool:
-        if not self.backend:
-            return False
-        try:
-            snap = self.backend.poll_telemetry(
-                force_full=force_full or self.holding_d0,
-                wake_dsp=self.wake_on_poll,
-            )
-            self.dashboard.update_snapshot(snap)
+        self._poll_once_Async(force_full)
+        return False
 
-            pstate = "D0i0 (Active)" if snap.pm_runtime_active else "D3 (Sleep)"
-            hp_kb = snap.hpsram.powered_banks * 128
-            hp_tot_kb = snap.hpsram.total_banks * 128
-            lp_kb = snap.lpsram.powered_banks * 64
-            lp_tot_kb = max(64, snap.lpsram.total_banks * 64)
-            self._set_status(
-                f"Platform: {snap.platform} | FW: v{snap.fw_version} ({snap.fw_state_name}) | "
-                f"Power: {pstate} | Cores: 0x{snap.enabled_cores_mask:x}/{snap.num_cores} | "
-                f"HPSRAM: {hp_kb}/{hp_tot_kb} KB | LPSRAM: {lp_kb}/{lp_tot_kb} KB | "
-                f"DRAM (L3/IMR): {snap.dram_used_kb:,.0f}/{snap.dram_total_kb:,.0f} KB | "
-                f"Tasks: {len(snap.tasks)}"
-            )
-        except Exception as e:
-            self._set_status(f"Telemetry poll error: {e}")
+    def _poll_once_Async(self, force_full: bool = False):
+        if self.poll_in_flight:
+            return
+        self.poll_in_flight = True
+        full = force_full or self.holding_d0
+        wake = self.wake_on_poll
+
+        def _worker():
+            try:
+                with self.io_lock:
+                    be = self.backend
+                    if not be:
+                        return
+                    snap = be.poll_telemetry(force_full=full, wake_dsp=wake)
+                    if snap.connected and snap.pm_runtime_active and snap.fw_state == 7:
+                        if not self.perf_meas_initialized:
+                            st_perf = be.set_perf_measurement_state(2)
+                            self.perf_meas_initialized = True
+                            if st_perf == 0:
+                                snap = be.poll_telemetry(force_full=True, wake_dsp=wake)
+                    elif not snap.connected or snap.fw_state != 7:
+                        self.perf_meas_initialized = False
+                GLib.idle_add(self._apply_snapshot, snap)
+            except Exception as e:
+                GLib.idle_add(self._set_status, f"Telemetry poll error: {e}")
+            finally:
+                self.poll_in_flight = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_snapshot(self, snap: TelemetrySnapshot) -> bool:
+        if not snap.connected:
+            self._set_status("Target disconnected — retaining last valid telemetry snapshot")
+            return False
+
+        self.dashboard.update_snapshot(snap)
+        pstate = "D0i0 (Active)" if snap.pm_runtime_active else "D3 (Sleep)"
+        hp_kb = snap.hpsram.powered_banks * 128
+        hp_tot_kb = snap.hpsram.total_banks * 128
+        lp_kb = snap.lpsram.powered_banks * 64
+        lp_tot_kb = snap.lpsram.total_banks * 64
+        self._set_status(
+            f"Platform: {snap.platform} | FW: v{snap.fw_version} ({snap.fw_state_name}) | "
+            f"Power: {pstate} | Cores: 0x{snap.enabled_cores_mask:x}/{snap.num_cores} | "
+            f"HPSRAM: {hp_kb}/{hp_tot_kb} KB | LPSRAM: {lp_kb}/{lp_tot_kb} KB | "
+            f"DRAM (L3/IMR): {snap.dram_used_kb:,.0f}/{snap.dram_total_kb:,.0f} KB | "
+            f"Tasks: {len(snap.tasks)}"
+        )
         return False
 
     def _on_wake_dsp(self, _btn):
-        if not self.backend:
-            return
-        st, res = self.backend.pm_control(SOF_PM_OP_BOOT_DSP)
-        self._set_status(f"Wake DSP (st={st}): {res}")
-        self._poll_once(True)
+        def _worker():
+            with self.io_lock:
+                if not self.backend:
+                    return
+                st, res = self.backend.pm_control(SOF_PM_OP_BOOT_DSP)
+            GLib.idle_add(self._set_status, f"Wake DSP (st={st}): {res}")
+            self._poll_once_Async(True)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_toggle_hold_d0(self, btn: Gtk.ToggleButton):
-        if not self.backend:
-            return
-        op = SOF_PM_OP_WAKE_HOLD if btn.get_active() else SOF_PM_OP_RELEASE_HOLD
-        st, res = self.backend.pm_control(op)
-        self.holding_d0 = bool(res.get("fd_holding_d0", False))
-        self._set_status(f"PM Hold D0 = {self.holding_d0} (st={st}): {res}")
-        self._poll_once(True)
+        active = btn.get_active()
+
+        def _worker():
+            with self.io_lock:
+                if not self.backend:
+                    return
+                op = SOF_PM_OP_WAKE_HOLD if active else SOF_PM_OP_RELEASE_HOLD
+                st, res = self.backend.pm_control(op)
+                self.holding_d0 = bool(res.get("fd_holding_d0", False))
+            GLib.idle_add(
+                self._set_status, f"PM Hold D0 = {self.holding_d0} (st={st}): {res}"
+            )
+            self._poll_once_Async(True)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_toggle_wake_poll(self, btn: Gtk.ToggleButton):
         self.wake_on_poll = btn.get_active()
@@ -296,7 +365,7 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
 
 
 def render_user_dashboard_to_png(
-    dash_w: UserDashboardCairoWidget,
+    dash_w,
     out_path: str,
     width: int = 1360,
     height: int = 840,
@@ -328,22 +397,35 @@ def run_headless_render(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        dash_w = UserDashboardCairoWidget()
+        dash_r = UserDashboardRenderer()
         if args.wake:
             backend.pm_control(SOF_PM_OP_WAKE_HOLD)
             backend.set_perf_measurement_state(2)
 
         snap = None
+        valid_polls = 0
         for _ in range(6):
-            snap = backend.poll_telemetry(force_full=True, wake_dsp=args.wake)
-            dash_w.update_snapshot(snap)
+            s = backend.poll_telemetry(force_full=True, wake_dsp=args.wake)
+            if s.connected:
+                if valid_polls == 0 and s.pm_runtime_active and s.fw_state == 7:
+                    backend.set_perf_measurement_state(2)
+                snap = s
+                dash_r.update_snapshot(snap)
+                valid_polls += 1
             time.sleep(0.12)
 
-        out_file = render_user_dashboard_to_png(dash_w, args.render_png)
+        if not snap or not snap.connected:
+            print(
+                f"ERROR: Failed to retrieve telemetry snapshot from {target}",
+                file=sys.stderr,
+            )
+            return 1
+
+        out_file = render_user_dashboard_to_png(dash_r, args.render_png)
         hp_kb = snap.hpsram.powered_banks * 128
         hp_tot_kb = snap.hpsram.total_banks * 128
         lp_kb = snap.lpsram.powered_banks * 64
-        lp_tot_kb = max(64, snap.lpsram.total_banks * 64)
+        lp_tot_kb = snap.lpsram.total_banks * 64
         print(
             f"Rendered {out_file} "
             f"(platform={snap.platform}, fw=v{snap.fw_version}, state={snap.fw_state} [{snap.fw_state_name}], "
@@ -352,6 +434,11 @@ def run_headless_render(args: argparse.Namespace) -> int:
             f"tasks={len(snap.tasks)})"
         )
     finally:
+        if args.wake:
+            try:
+                backend.pm_control(SOF_PM_OP_RELEASE_HOLD)
+            except Exception:
+                pass
         backend.close()
     return 0
 
