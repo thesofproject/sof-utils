@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SOF Top
+GenericName=SOF DSP Resource & Task Monitor
+Comment=Real-Time Moving DSP Core & Memory (SRAM/DRAM) Utilization Graphs and DSP Task Monitor
+Exec=sof-top
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;AudioVideo;Audio;
+Keywords=SOF;DSP;Audio;Telemetry;Monitor;SRAM;DRAM;
+StartupWMClass=org.thesofproject.SofTop
