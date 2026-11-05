@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright(c) 2026 Intel Corporation. All rights reserved.
+"""
+sof-top — SOF DSP User Resource, Memory (SRAM + DRAM) & Task Monitor (GTK4 + Snapshot + Cairo)
+
+User Edition features:
+  1. Moving Graph for DSP Core Utilization (% of DSP clock & KCPS per core)
+  2. Moving Graph for DSP Memory Utilization (HPSRAM, LPSRAM, DRAM L3/IMR, and Heaps)
+  3. Unified DSP Task List with Resources & Status (Modules, RTOS Threads, Schedulers, DAIs)
+
+Usage:
+  sof-top --host aphid --wake
+  sof-top --host dragon-fly --port 9998
+  sof-top --local /dev/sof-dsp0
+  sof-top --host aphid --wake --render-png /tmp/softop_user
+"""
+
+import argparse
+import os
+import sys
+import time
+
+# Ensure imports resolve from the directory containing sof-top even when invoked via symlink
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GLib", "2.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gtk, Gdk, GLib
+import cairo
+
+from backend import (
+    RemoteTcpBackend,
+    LocalCdevBackend,
+    SOF_PM_OP_WAKE_HOLD,
+    SOF_PM_OP_RELEASE_HOLD,
+    SOF_PM_OP_BOOT_DSP,
+)
+from widgets_cairo import UserDashboardCairoWidget
+
+
+DARK_CSS = b"""
+window, .main-bg {
+    background-color: #0d1117;
+    color: #e6edf3;
+}
+headerbar {
+    background-color: #161b22;
+    color: #e6edf3;
+    border-bottom: 1px solid #30363d;
+}
+.toolbar-box {
+    background-color: #161b22;
+    border-bottom: 1px solid #30363d;
+    padding: 6px 10px;
+}
+.status-bar {
+    background-color: #161b22;
+    border-top: 1px solid #30363d;
+    padding: 4px 10px;
+    font-family: monospace;
+    font-size: 12px;
+}
+button {
+    background-image: none;
+    background-color: #21262d;
+    color: #e6edf3;
+    border: 1px solid #30363d;
+    border-radius: 5px;
+    padding: 4px 10px;
+}
+button:hover {
+    background-color: #30363d;
+}
+button:checked {
+    background-color: #1f6feb;
+    color: #ffffff;
+    border-color: #58a6ff;
+}
+entry {
+    background-color: #0d1117;
+    color: #e6edf3;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    font-family: monospace;
+}
+"""
+
+
+class SofTopUserWindow(Gtk.ApplicationWindow):
+    """Main GTK4 Window for sof-top (User Edition)."""
+
+    def __init__(self, app: Gtk.Application, args: argparse.Namespace):
+        super().__init__(
+            application=app,
+            title="sof-top — SOF DSP Core, Memory (SRAM/DRAM) & Task Monitor",
+        )
+        self.set_default_size(1440, 880)
+        self.args = args
+        self.backend = None
+        self.poll_timer_id = None
+        self.poll_interval_ms = args.interval
+        self.wake_on_poll = args.wake
+        self.holding_d0 = False
+
+        self._apply_css()
+        self._build_ui()
+        self._connect_backend(args.target)
+
+        if self.poll_interval_ms > 0:
+            self.poll_timer_id = GLib.timeout_add(self.poll_interval_ms, self._on_poll_tick)
+        GLib.idle_add(self._poll_once, True)
+
+    def _apply_css(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(DARK_CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+    def _build_ui(self):
+        header = Gtk.HeaderBar()
+        self.set_titlebar(header)
+
+        title_lbl = Gtk.Label(
+            label="sof-top — DSP Core Utilization, Memory (SRAM + DRAM) & Task Monitor"
+        )
+        header.set_title_widget(title_lbl)
+
+        target_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        target_box.append(Gtk.Label(label="Target:"))
+
+        self.target_entry = Gtk.Entry()
+        self.target_entry.set_text(self.args.target)
+        self.target_entry.set_width_chars(20)
+        self.target_entry.connect(
+            "activate", lambda e: self._connect_backend(e.get_text().strip())
+        )
+        target_box.append(self.target_entry)
+
+        btn_conn = Gtk.Button(label="Connect")
+        btn_conn.connect(
+            "clicked", lambda _: self._connect_backend(self.target_entry.get_text().strip())
+        )
+        target_box.append(btn_conn)
+        header.pack_start(target_box)
+
+        btn_snap = Gtk.Button(label="Export PNG")
+        btn_snap.connect("clicked", self._on_export_png)
+        header.pack_end(btn_snap)
+
+        root_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root_box.add_css_class("main-bg")
+        self.set_child(root_box)
+
+        # Streamlined User Toolbar
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        toolbar.add_css_class("toolbar-box")
+        root_box.append(toolbar)
+
+        btn_wake = Gtk.Button(label="Wake / Boot DSP")
+        btn_wake.connect("clicked", self._on_wake_dsp)
+        toolbar.append(btn_wake)
+
+        self.btn_hold_d0 = Gtk.ToggleButton(label="Hold D0i0")
+        self.btn_hold_d0.connect("toggled", self._on_toggle_hold_d0)
+        toolbar.append(self.btn_hold_d0)
+
+        self.btn_wake_poll = Gtk.ToggleButton(label="Wake on Poll")
+        self.btn_wake_poll.set_active(self.wake_on_poll)
+        self.btn_wake_poll.connect("toggled", self._on_toggle_wake_poll)
+        toolbar.append(self.btn_wake_poll)
+
+        toolbar.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+        lbl_rate = Gtk.Label(label="Refresh Rate:")
+        toolbar.append(lbl_rate)
+        for ms, txt in [(100, "10Hz"), (250, "4Hz"), (500, "2Hz"), (1000, "1Hz"), (0, "Pause")]:
+            b = Gtk.Button(label=txt)
+            b.connect("clicked", self._on_set_poll_rate, ms)
+            toolbar.append(b)
+
+        self.dashboard = UserDashboardCairoWidget()
+        root_box.append(self.dashboard)
+
+        self.status_label = Gtk.Label(label="Initializing...")
+        self.status_label.set_xalign(0.0)
+        self.status_label.add_css_class("status-bar")
+        root_box.append(self.status_label)
+
+    def _connect_backend(self, target: str):
+        if self.backend:
+            try:
+                self.backend.close()
+            except Exception:
+                pass
+            self.backend = None
+
+        try:
+            if target.startswith("/") or target.startswith("local:"):
+                dev_path = target.split("local:", 1)[-1] if target.startswith("local:") else target
+                self.backend = LocalCdevBackend(dev_path, self.args.port)
+            else:
+                if ":" in target:
+                    host, port_s = target.rsplit(":", 1)
+                    port = int(port_s)
+                else:
+                    host, port = target, self.args.port
+                self.backend = RemoteTcpBackend(host, port)
+            if self.backend.connect():
+                self._set_status(f"Connected to {target}")
+                self._poll_once(True)
+            else:
+                self._set_status(f"Failed to connect to {target}")
+        except Exception as e:
+            self._set_status(f"Connection to '{target}' failed: {e}")
+
+    def _set_status(self, msg: str):
+        self.status_label.set_text(msg)
+
+    def _on_poll_tick(self) -> bool:
+        if self.poll_interval_ms <= 0:
+            return False
+        self._poll_once(False)
+        return True
+
+    def _poll_once(self, force_full: bool = False) -> bool:
+        if not self.backend:
+            return False
+        try:
+            snap = self.backend.poll_telemetry(
+                force_full=force_full or self.holding_d0,
+                wake_dsp=self.wake_on_poll,
+            )
+            self.dashboard.update_snapshot(snap)
+
+            pstate = "D0i0 (Active)" if snap.pm_runtime_active else "D3 (Sleep)"
+            hp_kb = snap.hpsram.powered_banks * 128
+            hp_tot_kb = snap.hpsram.total_banks * 128
+            lp_kb = snap.lpsram.powered_banks * 64
+            lp_tot_kb = max(64, snap.lpsram.total_banks * 64)
+            self._set_status(
+                f"Platform: {snap.platform} | FW: v{snap.fw_version} ({snap.fw_state_name}) | "
+                f"Power: {pstate} | Cores: 0x{snap.enabled_cores_mask:x}/{snap.num_cores} | "
+                f"HPSRAM: {hp_kb}/{hp_tot_kb} KB | LPSRAM: {lp_kb}/{lp_tot_kb} KB | "
+                f"DRAM (L3/IMR): {snap.dram_used_kb:,.0f}/{snap.dram_total_kb:,.0f} KB | "
+                f"Tasks: {len(snap.tasks)}"
+            )
+        except Exception as e:
+            self._set_status(f"Telemetry poll error: {e}")
+        return False
+
+    def _on_wake_dsp(self, _btn):
+        if not self.backend:
+            return
+        st, res = self.backend.pm_control(SOF_PM_OP_BOOT_DSP)
+        self._set_status(f"Wake DSP (st={st}): {res}")
+        self._poll_once(True)
+
+    def _on_toggle_hold_d0(self, btn: Gtk.ToggleButton):
+        if not self.backend:
+            return
+        op = SOF_PM_OP_WAKE_HOLD if btn.get_active() else SOF_PM_OP_RELEASE_HOLD
+        st, res = self.backend.pm_control(op)
+        self.holding_d0 = bool(res.get("fd_holding_d0", False))
+        self._set_status(f"PM Hold D0 = {self.holding_d0} (st={st}): {res}")
+        self._poll_once(True)
+
+    def _on_toggle_wake_poll(self, btn: Gtk.ToggleButton):
+        self.wake_on_poll = btn.get_active()
+        self._set_status(f"Wake on Poll = {self.wake_on_poll}")
+
+    def _on_set_poll_rate(self, _btn, ms: int):
+        if self.poll_timer_id:
+            GLib.source_remove(self.poll_timer_id)
+            self.poll_timer_id = None
+        self.poll_interval_ms = ms
+        if ms > 0:
+            self.poll_timer_id = GLib.timeout_add(ms, self._on_poll_tick)
+            self._set_status(f"Poll interval set to {ms} ms")
+        else:
+            self._set_status("Polling paused")
+
+    def _on_export_png(self, _btn):
+        out_path = "/tmp/softop_user_dashboard.png"
+        render_user_dashboard_to_png(self.dashboard, out_path)
+        self._set_status(f"Exported {out_path}")
+
+
+def render_user_dashboard_to_png(
+    dash_w: UserDashboardCairoWidget,
+    out_path: str,
+    width: int = 1360,
+    height: int = 840,
+):
+    if not out_path.endswith(".png"):
+        out_path = f"{out_path}_dashboard.png"
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+    cr = cairo.Context(surf)
+    dash_w.render_to_cairo(cr, float(width), float(height), None)
+    surf.write_to_png(out_path)
+    return out_path
+
+
+def run_headless_render(args: argparse.Namespace) -> int:
+    target = args.target
+    if target.startswith("/") or target.startswith("local:"):
+        dev_path = target.split("local:", 1)[-1] if target.startswith("local:") else target
+        backend = LocalCdevBackend(dev_path, args.port)
+    else:
+        if ":" in target:
+            host, port_s = target.rsplit(":", 1)
+            port = int(port_s)
+        else:
+            host, port = target, args.port
+        backend = RemoteTcpBackend(host, port)
+
+    if not backend.connect():
+        print(f"ERROR: Could not connect to {target}", file=sys.stderr)
+        return 1
+
+    try:
+        dash_w = UserDashboardCairoWidget()
+        if args.wake:
+            backend.pm_control(SOF_PM_OP_WAKE_HOLD)
+            backend.set_perf_measurement_state(2)
+
+        snap = None
+        for _ in range(6):
+            snap = backend.poll_telemetry(force_full=True, wake_dsp=args.wake)
+            dash_w.update_snapshot(snap)
+            time.sleep(0.12)
+
+        out_file = render_user_dashboard_to_png(dash_w, args.render_png)
+        hp_kb = snap.hpsram.powered_banks * 128
+        hp_tot_kb = snap.hpsram.total_banks * 128
+        lp_kb = snap.lpsram.powered_banks * 64
+        lp_tot_kb = max(64, snap.lpsram.total_banks * 64)
+        print(
+            f"Rendered {out_file} "
+            f"(platform={snap.platform}, fw=v{snap.fw_version}, state={snap.fw_state} [{snap.fw_state_name}], "
+            f"hpsram={hp_kb}/{hp_tot_kb} KB, lpsram={lp_kb}/{lp_tot_kb} KB, "
+            f"dram={snap.dram_used_kb:.0f}/{snap.dram_total_kb:.0f} KB, "
+            f"tasks={len(snap.tasks)})"
+        )
+    finally:
+        backend.close()
+    return 0
+
+
+class SofTopUserApp(Gtk.Application):
+    def __init__(self, args: argparse.Namespace):
+        super().__init__(application_id="org.thesofproject.SofTop")
+        self.args = args
+        self.win = None
+
+    def do_activate(self):
+        if not self.win:
+            self.win = SofTopUserWindow(self, self.args)
+        self.win.present()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="sof-top",
+        description="sof-top — SOF DSP User Monitor (Moving Core & SRAM/DRAM Memory Graphs + DSP Task List)",
+    )
+    ap.add_argument("-H", "--host", default="aphid", help="Remote host running sof_remote_server (default: aphid)")
+    ap.add_argument("-p", "--port", type=int, default=9998, help="Remote TCP port (default: 9998)")
+    ap.add_argument("-l", "--local", default="", help="Local char device path (e.g. /dev/sof-dsp0)")
+    ap.add_argument("-i", "--interval", type=int, default=250, help="Poll interval in ms (default: 250)")
+    ap.add_argument("-w", "--wake", action="store_true", help="Wake DSP on telemetry poll")
+    ap.add_argument("--render-png", default="", help="Render User Dashboard to PNG and exit")
+    args = ap.parse_args()
+
+    if args.local:
+        args.target = f"local:{args.local}"
+    else:
+        args.target = f"{args.host}:{args.port}"
+
+    if args.render_png:
+        sys.exit(run_headless_render(args))
+
+    app = SofTopUserApp(args)
+    sys.exit(app.run(None))
+
+
+if __name__ == "__main__":
+    main()
