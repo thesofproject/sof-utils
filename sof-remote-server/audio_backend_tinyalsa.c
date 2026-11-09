@@ -19,10 +19,11 @@
 #include <sys/ioctl.h>
 #include <sound/asound.h>
 
+#include "audio_backends.h"
+
+#ifdef HAVE_TINYALSA
 #include <tinyalsa/pcm.h>
 #include <tinyalsa/mixer.h>
-
-#include "audio_backends.h"
 
 static enum pcm_format sof_to_tinyalsa_format(uint32_t fmt_id)
 {
@@ -695,3 +696,99 @@ int tinyalsa_kctl_set(const struct sof_net_kctl_io_req *req,
 	rsp->status = err < 0 ? err : 0;
 	return rsp->status;
 }
+
+#else /* !HAVE_TINYALSA */
+
+int tinyalsa_query_pcm_caps(uint32_t card_id, uint32_t dev_id, uint32_t direction,
+			    struct sof_net_pcm_caps *out)
+{
+	(void)card_id;
+	(void)dev_id;
+	(void)direction;
+	if (out)
+		out->status = -ENOTSUP;
+	return -ENOTSUP;
+}
+
+int tinyalsa_pcm_play_frames(uint32_t card_id, uint32_t dev_id, uint32_t fmt_id,
+			     uint32_t rate, uint32_t channels,
+			     uint32_t period_size, uint32_t period_count,
+			     const void *pcm_data, uint32_t total_frames,
+			     _Atomic bool *keep_running, uint32_t freq_hz,
+			     _Atomic uint64_t *frames_counter,
+			     _Atomic uint32_t *rms_out,
+			     _Atomic uint32_t *peak_out,
+			     uint32_t *xruns_out)
+{
+	(void)card_id;
+	(void)dev_id;
+	(void)fmt_id;
+	(void)rate;
+	(void)channels;
+	(void)period_size;
+	(void)period_count;
+	(void)pcm_data;
+	(void)total_frames;
+	(void)keep_running;
+	(void)freq_hz;
+	(void)frames_counter;
+	(void)rms_out;
+	(void)peak_out;
+	(void)xruns_out;
+	return -ENOTSUP;
+}
+
+int tinyalsa_pcm_capture_frames(uint32_t card_id, uint32_t dev_id, uint32_t fmt_id,
+				uint32_t rate, uint32_t channels,
+				uint32_t period_size, uint32_t period_count,
+				void *out_buf, uint32_t max_frames,
+				uint32_t *frames_read_out,
+				uint32_t *rms_out, uint32_t *peak_out,
+				uint32_t *xruns_out)
+{
+	(void)card_id;
+	(void)dev_id;
+	(void)fmt_id;
+	(void)rate;
+	(void)channels;
+	(void)period_size;
+	(void)period_count;
+	(void)out_buf;
+	(void)max_frames;
+	(void)frames_read_out;
+	(void)rms_out;
+	(void)peak_out;
+	(void)xruns_out;
+	return -ENOTSUP;
+}
+
+int tinyalsa_kctl_list(uint32_t card_id, struct sof_net_kctl_info *out_arr,
+		       uint32_t max_items, uint32_t *count_out)
+{
+	(void)card_id;
+	(void)out_arr;
+	(void)max_items;
+	if (count_out)
+		*count_out = 0;
+	return -ENOTSUP;
+}
+
+int tinyalsa_kctl_get(const struct sof_net_kctl_io_req *req,
+		      struct sof_net_kctl_io_rsp *rsp)
+{
+	(void)req;
+	if (rsp)
+		rsp->status = -ENOTSUP;
+	return -ENOTSUP;
+}
+
+int tinyalsa_kctl_set(const struct sof_net_kctl_io_req *req,
+		      struct sof_net_kctl_io_rsp *rsp)
+{
+	(void)req;
+	if (rsp)
+		rsp->status = -ENOTSUP;
+	return -ENOTSUP;
+}
+
+#endif /* HAVE_TINYALSA */

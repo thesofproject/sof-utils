@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: BSD-3-Clause
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	true
+
+override_dh_auto_build:
+	$(MAKE) PREFIX=/usr all
+
+override_dh_auto_install:
+	$(MAKE) DESTDIR=$(CURDIR)/debian/sof-utils PREFIX=/usr install
+
+override_dh_auto_test:
+	$(MAKE) check
+
+override_dh_auto_clean:
+	$(MAKE) clean

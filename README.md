@@ -16,6 +16,29 @@ Developer utilities, visual tools, and host applications for the [Sound Open Fir
 
 ---
 
+## Build, Install & Package (`make`, `.deb`, `.rpm`)
+
+The top-level [`Makefile`](Makefile) builds, installs, and packages all `sof-utils` tools (`sof-builder`, `sof-top`, `sof_remote_server`, `sof-remote`, `sof-testbench4`, `sof-tb-ctl`, and `libsof_tplg_parser.a`):
+
+```bash
+# Build all tools (auto-detects SOF_SRC_DIR or pass SOF_SRC_DIR=/path/to/sof):
+make
+
+# Install all binaries, libraries, headers, Python apps, and .desktop files:
+sudo make install PREFIX=/usr
+
+# Build Debian (.deb) package into dist/:
+make deb
+
+# Build RPM (.rpm) package into dist/:
+make rpm
+
+# Build both .deb and .rpm packages into dist/:
+make packages
+```
+
+---
+
 ## Quick Start: `sof-testbench4` & `sof-tb-ctl`
 
 `sof-testbench/` builds `sof-testbench4` and `sof-tb-ctl` in a local build directory by compiling `sof-utils`'s host platform runtime (`sof-testbench/platform/library` and `sof-testbench/arch/host`) together with the firmware audio modules, pipeline engine, and IPC code directly from an SOF checkout (`${SOF_SRC_DIR}/src/`), leaving the `sof` checkout completely untouched.

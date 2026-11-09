@@ -9,5 +9,6 @@
 #include <pthread.h>
 
 int host_pin_thread_to_dsp_core(pthread_t thread, int dsp_core);
+void scheduler_dp_ll_tick(void);
 
 #endif /* __LIBRARY_SCHEDULE_HOST_SCHEDULE_H__ */

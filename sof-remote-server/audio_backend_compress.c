@@ -20,7 +20,9 @@
 #include <sound/asound.h>
 #include <sound/compress_params.h>
 #include <sound/compress_offload.h>
+#ifdef HAVE_TINYCOMPRESS
 #include <tinycompress/tinycompress.h>
+#endif
 
 #include "audio_backends.h"
 
@@ -141,6 +143,7 @@ int compr_handle_ctl(const struct sof_net_compr_req *req,
 		return 0;
 	}
 
+#ifdef HAVE_TINYCOMPRESS
 	struct snd_codec codec;
 	memset(&codec, 0, sizeof(codec));
 	codec.id = rsp.codec_id;
@@ -348,6 +351,10 @@ int compr_handle_ctl(const struct sof_net_compr_req *req,
 		*out_len_ptr = sizeof(rsp) + got_bytes;
 		return 0;
 	}
+#else
+	(void)payload_in;
+	return -ENOTSUP;
+#endif
 
 	return -EINVAL;
 }
