@@ -1094,10 +1094,12 @@ static void refresh_emulated_windows(struct testbench_prm *tp)
 						gc->index = (uint8_t)gi;
 						gc->direction = (uint8_t)(icd->cd->direction & 1);
 						gc->dma_chan = (int8_t)gi;
-						gc->comp_id = (uint16_t)(icd->id & 0xFFFFU);
+						gc->comp_id = icd->id;
 						gc->state = (uint8_t)icd->cd->state;
 						gc->group_id = 0;
-						gc->period_bytes = mt && mt->ibs ? mt->ibs : 384U;
+						gc->period_bytes = (uint16_t)((mt && mt->ibs) ?
+									      (mt->ibs > 0xFFFFU ? 0xFFFFU : mt->ibs) :
+									      384U);
 						gc->dma_buf_size = gc->period_bytes * 2U;
 
 						if (mt && mt->num_out_pins > 0) {

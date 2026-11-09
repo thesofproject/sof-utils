@@ -635,6 +635,8 @@ class TestbenchRemoteClient:
         self.last_raw_bytes: int = 0
         self._no_compress: bool = False
         self.cached_modules: Dict[int, str] = dict(WELL_KNOWN_IPC4_MODULES)
+        self.cached_hpsram: Optional[SramSegmentState] = None
+        self.cached_lpsram: Optional[SramSegmentState] = None
         # Metadata populated when pipelines/modules are created purely via IPC4 (no -t topology loaded on server)
         self.ipc_widget_map: Dict[int, Tuple[str, int]] = {}  # comp_id -> (widget_name, pipeline_id)
         self.ipc_kcontrols: List[KcontrolTelemetryItem] = []
@@ -1578,10 +1580,16 @@ class TestbenchRemoteClient:
                         seg.gated_banks += 1
                     else:
                         seg.powered_banks += 1
-                if ttype == 1:
+                if ttype == 1 and seg.total_banks > 0:
+                    self.cached_hpsram = seg
                     telem.hpsram = seg
-                elif ttype == 0:
+                elif ttype == 0 and seg.total_banks > 0:
+                    self.cached_lpsram = seg
                     telem.lpsram = seg
+        if telem.hpsram.total_banks == 0 and self.cached_hpsram is not None:
+            telem.hpsram = self.cached_hpsram
+        if telem.lpsram.total_banks == 0 and self.cached_lpsram is not None:
+            telem.lpsram = self.cached_lpsram
 
         # 3. Power State TLV
         core_kcps_map: Dict[int, int] = {}
@@ -1636,14 +1644,45 @@ class TestbenchRemoteClient:
         comp_items: List[ComponentPerfItem] = []
         if (flags_present & SOF_TELEM_FL_EXT_PERF_TLV) and len(ext_perf_tlv) >= 4:
             (count,) = struct.unpack_from("<I", ext_perf_tlv, 0)
+            count = min(count, 128)
             e_off = 4
-            for _ in range(min(count, 128)):
-                if e_off + 32 > len(ext_perf_tlv):
+            rem_e = len(ext_perf_tlv) - 4
+            if count > 0 and rem_e >= count * 48:
+                e_stride = 48
+            elif count > 0 and rem_e >= count * 32:
+                e_stride = 32
+            else:
+                e_stride = 16
+            for _ in range(count):
+                if e_off + e_stride > len(ext_perf_tlv):
                     break
-                res_id, cflags, peak_kcps, avg_kcps, iters, cycles = struct.unpack_from(
-                    "<IIIIQQ", ext_perf_tlv, e_off
-                )
-                e_off += 32
+                if e_stride == 48:
+                    (
+                        res_id,
+                        cflags,
+                        peak_cyc,
+                        cycles,
+                        iters,
+                        _r_peak,
+                        _r_tot,
+                        _r_it,
+                    ) = struct.unpack_from("<IIIQQIQQ", ext_perf_tlv, e_off)
+                    avg_cyc = (cycles // max(1, iters)) if iters > 0 else (peak_cyc // 1000)
+                    peak_kcps = peak_cyc // 1000 if peak_cyc >= 1000 else peak_cyc
+                    avg_kcps = int(avg_cyc)
+                    is_rem = bool((cflags >> 31) & 1)
+                elif e_stride == 32:
+                    res_id, cflags, peak_kcps, avg_kcps, iters, cycles = struct.unpack_from(
+                        "<IIIIQQ", ext_perf_tlv, e_off
+                    )
+                    is_rem = bool(((cflags >> 31) & 1) or ((cflags >> 1) & 1))
+                else:
+                    res_id, cflags, peak_kcps, avg_kcps = struct.unpack_from(
+                        "<IIII", ext_perf_tlv, e_off
+                    )
+                    iters, cycles = 0, 0
+                    is_rem = bool((cflags >> 31) & 1)
+                e_off += e_stride
                 mod_id = res_id & 0xFFFF
                 inst_id = (res_id >> 16) & 0xFFFF
                 if mod_id == 0:
@@ -1656,7 +1695,7 @@ class TestbenchRemoteClient:
                         instance_id=inst_id,
                         module_name=mname,
                         domain="DP" if (cflags & 1) else "LL",
-                        is_removed=bool((cflags >> 1) & 1),
+                        is_removed=is_rem,
                         avg_kcps=avg_kcps,
                         peak_kcps=peak_kcps,
                         iterations=iters,
@@ -1743,9 +1782,27 @@ class TestbenchRemoteClient:
                     "<HHHHIIII", t2_buf, 0x0240 - bias
                 )
                 if hp_tot > 0 and telem.hpsram.total_banks == 0:
-                    telem.hpsram.total_banks = (hp_tot + 15) // 16
+                    telem.hpsram.total_banks = (hp_tot + 31) // 32
                     telem.hpsram.free_phys_pages = hp_free
-                    telem.hpsram.powered_banks = bin(ebb_lo).count("1") + bin(ebb_hi).count("1")
+                    pwr_hp = bin(ebb_lo).count("1") + bin(ebb_hi).count("1")
+                    telem.hpsram.powered_banks = (
+                        pwr_hp
+                        if pwr_hp >= telem.hpsram.total_banks
+                        else (telem.hpsram.total_banks if hp_free < hp_tot else pwr_hp)
+                    )
+                    telem.hpsram.gated_banks = max(0, telem.hpsram.total_banks - telem.hpsram.powered_banks)
+                    self.cached_hpsram = telem.hpsram
+                if lp_tot > 0 and telem.lpsram.total_banks == 0:
+                    telem.lpsram.total_banks = (lp_tot + 15) // 16
+                    telem.lpsram.free_phys_pages = lp_free
+                    pwr_lp = bin(_lpebb).count("1")
+                    telem.lpsram.powered_banks = (
+                        min(telem.lpsram.total_banks, pwr_lp)
+                        if pwr_lp > 0
+                        else (telem.lpsram.total_banks if lp_free < lp_tot else 0)
+                    )
+                    telem.lpsram.gated_banks = max(0, telem.lpsram.total_banks - telem.lpsram.powered_banks)
+                    self.cached_lpsram = telem.lpsram
                 heap_names = {1: "SYS", 2: "SHARED", 3: "LL_USER", 4: "L3_IMR", 5: "DRV_USER"}
                 tot_alloc = 0
                 for hi in range(6):
@@ -1829,7 +1886,7 @@ class TestbenchRemoteClient:
                 gw_types = {1: "SSP", 2: "DMIC", 3: "ALH", 4: "HDA", 5: "HOST_DMA", 6: "OTHER"}
                 for gi in range(16):
                     gt, gidx, gdir, gch, gcid, gst, ggrp, gper, gbuf = struct.unpack_from(
-                        "<BBBbHBBII", t2_buf, 0x06C0 - bias + gi * 16
+                        "<BBBbIBBHI", t2_buf, 0x06C0 - bias + gi * 16
                     )
                     if gt == 0:
                         continue

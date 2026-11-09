@@ -151,13 +151,14 @@ GW_TYPE_NAMES = {
 }
 
 PPL_STATUS_NAMES = {
-    0: "INIT",
-    1: "INITIALIZED",
-    2: "RESET",
-    3: "PAUSED",
-    4: "RUNNING",
-    5: "EOS",
-    6: "ERROR",
+    0: "NOT_EXIST",
+    1: "INIT",
+    2: "READY",
+    3: "SUSPEND",
+    4: "PREPARE",
+    5: "PAUSED",
+    6: "ACTIVE",
+    7: "PRE_ACTIVE",
 }
 
 FW_STATE_NAMES = {
@@ -308,6 +309,10 @@ class IoPerfItem:
     resource_id: int
     power_mode: int
     perf_usage: int
+
+    @property
+    def utilization_kcps(self) -> int:
+        return self.perf_usage
 
 
 @dataclass
@@ -688,7 +693,7 @@ class TelemetryParser:
 
             seg = SramSegmentState("HPSRAM" if ttype == 1 else "LPSRAM")
             seg.total_banks = bank_count
-            seg.total_phys_pages = bank_count * 16
+            seg.total_phys_pages = bank_count * (32 if ttype == 1 else 16)
             seg.free_phys_pages = free_pages
             for b in range(bank_count):
                 dword_idx = b // 32
@@ -708,9 +713,9 @@ class TelemetryParser:
                     seg.bank_alloc_mask.append(amask)
                     alloc_off += 2
 
-            if ttype == 1:
+            if ttype == 1 and seg.total_banks > 0:
                 self.cached_hpsram = seg
-            elif ttype == 0:
+            elif ttype == 0 and seg.total_banks > 0:
                 self.cached_lpsram = seg
 
     def parse_power_state_tlv(self, data: bytes, snap: TelemetrySnapshot):
@@ -764,9 +769,9 @@ class TelemetryParser:
                     _r_tot,
                     _r_it,
                 ) = struct.unpack_from("<IIIQQIQQ", data, off)
-                avg_cyc = (total_cyc // max(1, iters)) if iters > 0 else peak_cyc
+                avg_cyc = (total_cyc // max(1, iters)) if iters > 0 else (peak_cyc // 1000)
                 peak_kcps = peak_cyc // 1000 if peak_cyc >= 1000 else peak_cyc
-                avg_kcps = int(avg_cyc // 1000) if avg_cyc >= 1000 else int(avg_cyc)
+                avg_kcps = int(avg_cyc)
                 cycles = total_cyc
             elif stride == 32:
                 res_id, flags, peak_kcps, avg_kcps, iters, cycles = struct.unpack_from(
@@ -863,9 +868,41 @@ class TelemetryParser:
                 if hp_tot > 0:
                     snap.hpsram.total_phys_pages = hp_tot
                     snap.hpsram.free_phys_pages = hp_free
+                    if snap.hpsram.total_banks == 0:
+                        hp_banks = (hp_tot + 31) // 32
+                        pwr_hp = bin(ebb_lo).count("1") + bin(ebb_hi).count("1")
+                        snap.hpsram.total_banks = hp_banks
+                        snap.hpsram.powered_banks = (
+                            pwr_hp
+                            if pwr_hp >= hp_banks
+                            else (hp_banks if hp_free < hp_tot else pwr_hp)
+                        )
+                        snap.hpsram.gated_banks = max(
+                            0, snap.hpsram.total_banks - snap.hpsram.powered_banks
+                        )
+                        snap.hpsram.bank_powered = [
+                            b < snap.hpsram.powered_banks for b in range(hp_banks)
+                        ]
+                        self.cached_hpsram = snap.hpsram
                 if lp_tot > 0:
                     snap.lpsram.total_phys_pages = lp_tot
                     snap.lpsram.free_phys_pages = lp_free
+                    if snap.lpsram.total_banks == 0:
+                        lp_banks = (lp_tot + 15) // 16
+                        pwr_lp = bin(lp_ebb).count("1")
+                        snap.lpsram.total_banks = lp_banks
+                        snap.lpsram.powered_banks = (
+                            min(lp_banks, pwr_lp)
+                            if pwr_lp > 0
+                            else (lp_banks if lp_free < lp_tot else 0)
+                        )
+                        snap.lpsram.gated_banks = max(
+                            0, snap.lpsram.total_banks - snap.lpsram.powered_banks
+                        )
+                        snap.lpsram.bank_powered = [
+                            b < snap.lpsram.powered_banks for b in range(lp_banks)
+                        ]
+                        self.cached_lpsram = snap.lpsram
 
                 # Heaps[6] (each 20B at mem_off + 24)
                 snap.heaps = []
@@ -1264,7 +1301,7 @@ class TelemetryParser:
 
         # 4) Add Active DAI Gateways (using measured performance counters when available)
         io_kcps_by_id: Dict[int, int] = {
-            io.resource_id: io.utilization_kcps for io in snap.io_perf_items
+            io.resource_id: io.perf_usage for io in snap.io_perf_items
         }
         for gw in snap.gateways:
             dir_s = "RX" if gw.direction else "TX"

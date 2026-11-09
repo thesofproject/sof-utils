@@ -580,10 +580,10 @@ struct sof_tel_gw_cold {
 	uint8_t  index;
 	uint8_t  direction;
 	int8_t   dma_chan;
-	uint16_t comp_id;
+	uint32_t comp_id;
 	uint8_t  state;
 	uint8_t  group_id;
-	uint32_t period_bytes;
+	uint16_t period_bytes;
 	uint32_t dma_buf_size;
 } __attribute__((packed));
 

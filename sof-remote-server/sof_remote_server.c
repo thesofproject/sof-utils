@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <signal.h>
 #include <pthread.h>
@@ -545,7 +546,7 @@ static int get_sof_card_index(void)
 		while ((de = readdir(cd)) != NULL) {
 			if (sscanf(de->d_name, "card%u", &idx) != 1)
 				continue;
-			char dev_link[256], resolved[512];
+			char dev_link[256], resolved[PATH_MAX];
 			snprintf(dev_link, sizeof(dev_link),
 				 "/sys/class/sound/%s/device", de->d_name);
 			if (realpath(dev_link, resolved)) {
@@ -1212,13 +1213,15 @@ struct client_telem_state {
  * TEL2 (MW2 Slot 1) and PMW2 (MW3) when /dev/sof-dsp0 IPC ioctls are unavailable.
  */
 static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
+					 uint32_t query_mask,
 					 struct client_telem_state *tstate)
 {
 	const uint8_t *t2 = snap->tel2_slot;
 	uint8_t *w3 = snap->pmw2_win3;
 	int bias = sof_tel2_slot_bias(t2, snap->tel2_slot_len);
 
-	synthesize_modules_info_from_fw(snap);
+	if (query_mask & SOF_TELEM_FL_MODULES_INFO_TLV)
+		synthesize_modules_info_from_fw(snap);
 
 	/*
 	 * Sanitize per-core system_tick_info in snap->telem_slot:
@@ -1278,7 +1281,8 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 	}
 
 	/* 1. Synthesize pwr_state_tlv & enabled_cores_mask from TEL2 */
-	if ( !(snap->flags_present & SOF_TELEM_FL_PWR_STATE_TLV) &&
+	if ((query_mask & SOF_TELEM_FL_PWR_STATE_TLV) &&
+	    !(snap->flags_present & SOF_TELEM_FL_PWR_STATE_TLV) &&
 	    (snap->flags_present & SOF_TELEM_FL_TELEM_SLOT)) {
 		uint32_t core_mask = 1;
 		uint32_t core_kcps[SOF_TEL_MAX_CORES] = {0};
@@ -1309,8 +1313,8 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 		snap->flags_present |= SOF_TELEM_FL_PWR_STATE_TLV;
 	}
 
-	/* 2. Synthesize mem_state_tlv only when TEL2 mem_sec.sram is present */
-	if (!(snap->flags_present & SOF_TELEM_FL_MEM_STATE_TLV)) {
+	/* 2. Synthesize or patch mem_state_tlv when requested and TEL2 mem_sec.sram is present */
+	if (query_mask & SOF_TELEM_FL_MEM_STATE_TLV) {
 		uint32_t hp_tot_pages = 0, hp_free_pages = 0, hp_banks = 0;
 		uint32_t pgctl[3] = { 0xFFFFFFFFU, 0xFFFFFFFFU, 0xFFFFFFFFU };
 		uint32_t lp_tot_pages = 0, lp_free_pages = 0, lp_banks = 0;
@@ -1324,7 +1328,7 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 				(t2 + SOF_TEL_OFF_MEM_SEC - bias);
 			hp_tot_pages = ms->sram.hp_sram_total_pages;
 			hp_free_pages = ms->sram.hp_sram_free_pages;
-			hp_banks = (hp_tot_pages + 15U) / 16U;
+			hp_banks = (hp_tot_pages + 31U) / 32U;
 			pgctl[0] = ~ms->sram.ebb_power_mask_lo;
 			pgctl[1] = ~ms->sram.ebb_power_mask_hi;
 			lp_tot_pages = ms->sram.lp_sram_total_pages;
@@ -1333,55 +1337,106 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 			lp_pgctl = ~ms->sram.lpsram_ebb_mask;
 		}
 
-		if (hp_banks > 0 && hp_banks <= 96) {
-			uint32_t off = 0;
-			uint32_t ttype = 1; /* HPSRAM */
-			uint32_t ebb_dwords = (hp_banks + 31U) / 32U;
-			uint32_t vlen = 12U + ebb_dwords * 4U + hp_banks * 2U;
-			memcpy(snap->mem_state_tlv + off, &ttype, 4); off += 4;
-			memcpy(snap->mem_state_tlv + off, &vlen, 4);  off += 4;
-			memcpy(snap->mem_state_tlv + off, &hp_free_pages, 4); off += 4;
-			memcpy(snap->mem_state_tlv + off, &ebb_dwords, 4); off += 4;
-			for (uint32_t d = 0; d < ebb_dwords; d++) {
-				memcpy(snap->mem_state_tlv + off, &pgctl[d], 4);
-				off += 4;
-			}
-			memcpy(snap->mem_state_tlv + off, &hp_banks, 4); off += 4;
-			uint32_t used_banks = (hp_tot_pages >= hp_free_pages) ?
-					      ((hp_tot_pages - hp_free_pages + 15U) / 16U) : 1U;
-			for (uint32_t b = 0; b < hp_banks; b++) {
-				uint16_t amask = (b < used_banks) ? 0xFFFFU : 0x0000U;
-				memcpy(snap->mem_state_tlv + off, &amask, 2);
-				off += 2;
-			}
+		if (!(snap->flags_present & SOF_TELEM_FL_MEM_STATE_TLV)) {
+			if (hp_banks > 0 && hp_banks <= 96) {
+				uint32_t off = 0;
+				uint32_t ttype = 1; /* HPSRAM */
+				uint32_t ebb_dwords = (hp_banks + 31U) / 32U;
+				uint32_t vlen = 12U + ebb_dwords * 4U + hp_banks * 2U;
+				memcpy(snap->mem_state_tlv + off, &ttype, 4); off += 4;
+				memcpy(snap->mem_state_tlv + off, &vlen, 4);  off += 4;
+				memcpy(snap->mem_state_tlv + off, &hp_free_pages, 4); off += 4;
+				memcpy(snap->mem_state_tlv + off, &ebb_dwords, 4); off += 4;
+				for (uint32_t d = 0; d < ebb_dwords; d++) {
+					memcpy(snap->mem_state_tlv + off, &pgctl[d], 4);
+					off += 4;
+				}
+				memcpy(snap->mem_state_tlv + off, &hp_banks, 4); off += 4;
+				uint32_t used_banks = (hp_tot_pages >= hp_free_pages) ?
+						      ((hp_tot_pages - hp_free_pages + 31U) / 32U) : 1U;
+				for (uint32_t b = 0; b < hp_banks; b++) {
+					uint16_t amask = (b < used_banks) ? 0xFFFFU : 0x0000U;
+					memcpy(snap->mem_state_tlv + off, &amask, 2);
+					off += 2;
+				}
 
-			if (lp_banks > 0 && lp_banks <= 32 &&
-			    off + 20U + lp_banks * 2U <= sizeof(snap->mem_state_tlv)) {
+				if (lp_banks > 0 && lp_banks <= 32 &&
+				    off + 20U + lp_banks * 2U <= sizeof(snap->mem_state_tlv)) {
+					uint32_t lp_type = 0; /* LPSRAM */
+					uint32_t lp_dwords = 1U;
+					uint32_t lp_vlen = 12U + lp_dwords * 4U + lp_banks * 2U;
+					memcpy(snap->mem_state_tlv + off, &lp_type, 4); off += 4;
+					memcpy(snap->mem_state_tlv + off, &lp_vlen, 4); off += 4;
+					memcpy(snap->mem_state_tlv + off, &lp_free_pages, 4); off += 4;
+					memcpy(snap->mem_state_tlv + off, &lp_dwords, 4); off += 4;
+					memcpy(snap->mem_state_tlv + off, &lp_pgctl, 4); off += 4;
+					memcpy(snap->mem_state_tlv + off, &lp_banks, 4); off += 4;
+					uint32_t lp_used = (lp_tot_pages >= lp_free_pages) ?
+							   ((lp_tot_pages - lp_free_pages + 15U) / 16U) : 0U;
+					for (uint32_t b = 0; b < lp_banks; b++) {
+						uint16_t amask = (b < lp_used) ? 0xFFFFU : 0x0000U;
+						memcpy(snap->mem_state_tlv + off, &amask, 2);
+						off += 2;
+					}
+				}
+
+				snap->mem_state_len = off;
+				snap->flags_present |= SOF_TELEM_FL_MEM_STATE_TLV;
+			}
+		} else if (lp_banks > 0 && lp_banks <= 32 && snap->mem_state_len >= 8) {
+			/*
+			 * On platforms where LPSRAM is 64 KB (1 bank) and basefw_mem_state_info
+			 * divides 64 KB by SRAM_BANK_SIZE (128 KB) == 0, the IPC4 LPSRAM tuple
+			 * reports 0 banks. Patch or append the LPSRAM tuple from TEL2.
+			 */
+			uint32_t off = 0;
+			uint32_t hp_end = 0;
+			bool lp_valid = false;
+			while (off + 8 <= snap->mem_state_len) {
+				uint32_t ttype = 0, tlen = 0;
+				memcpy(&ttype, snap->mem_state_tlv + off, 4);
+				memcpy(&tlen, snap->mem_state_tlv + off + 4, 4);
+				if (tlen == 0 || off + 8 + tlen > snap->mem_state_len)
+					break;
+				if (ttype == 1) {
+					hp_end = off + 8 + tlen;
+				} else if (ttype == 0 && tlen >= 12) {
+					uint32_t ebb_dw = 0, bcnt = 0;
+					memcpy(&ebb_dw, snap->mem_state_tlv + off + 12, 4);
+					if (ebb_dw <= 8 && 12 + ebb_dw * 4 <= tlen)
+						memcpy(&bcnt, snap->mem_state_tlv + off + 16 + ebb_dw * 4, 4);
+					if (ebb_dw > 0 && bcnt > 0)
+						lp_valid = true;
+				}
+				off += 8 + tlen;
+			}
+			if (!lp_valid && hp_end > 0 &&
+			    hp_end + 24U + lp_banks * 2U <= sizeof(snap->mem_state_tlv)) {
+				uint32_t p_off = hp_end;
 				uint32_t lp_type = 0; /* LPSRAM */
 				uint32_t lp_dwords = 1U;
 				uint32_t lp_vlen = 12U + lp_dwords * 4U + lp_banks * 2U;
-				memcpy(snap->mem_state_tlv + off, &lp_type, 4); off += 4;
-				memcpy(snap->mem_state_tlv + off, &lp_vlen, 4); off += 4;
-				memcpy(snap->mem_state_tlv + off, &lp_free_pages, 4); off += 4;
-				memcpy(snap->mem_state_tlv + off, &lp_dwords, 4); off += 4;
-				memcpy(snap->mem_state_tlv + off, &lp_pgctl, 4); off += 4;
-				memcpy(snap->mem_state_tlv + off, &lp_banks, 4); off += 4;
+				memcpy(snap->mem_state_tlv + p_off, &lp_type, 4); p_off += 4;
+				memcpy(snap->mem_state_tlv + p_off, &lp_vlen, 4); p_off += 4;
+				memcpy(snap->mem_state_tlv + p_off, &lp_free_pages, 4); p_off += 4;
+				memcpy(snap->mem_state_tlv + p_off, &lp_dwords, 4); p_off += 4;
+				memcpy(snap->mem_state_tlv + p_off, &lp_pgctl, 4); p_off += 4;
+				memcpy(snap->mem_state_tlv + p_off, &lp_banks, 4); p_off += 4;
 				uint32_t lp_used = (lp_tot_pages >= lp_free_pages) ?
 						   ((lp_tot_pages - lp_free_pages + 15U) / 16U) : 0U;
 				for (uint32_t b = 0; b < lp_banks; b++) {
 					uint16_t amask = (b < lp_used) ? 0xFFFFU : 0x0000U;
-					memcpy(snap->mem_state_tlv + off, &amask, 2);
-					off += 2;
+					memcpy(snap->mem_state_tlv + p_off, &amask, 2);
+					p_off += 2;
 				}
+				snap->mem_state_len = p_off;
 			}
-
-			snap->mem_state_len = off;
-			snap->flags_present |= SOF_TELEM_FL_MEM_STATE_TLV;
 		}
 	}
 
 	/* 3. Synthesize ext_perf_tlv from TEL2 core ticks + PMW2 MW3 perf_data[88] */
-	if (!(snap->flags_present & SOF_TELEM_FL_EXT_PERF_TLV) &&
+	if ((query_mask & SOF_TELEM_FL_EXT_PERF_TLV) &&
+	    !(snap->flags_present & SOF_TELEM_FL_EXT_PERF_TLV) &&
 	    (snap->flags_present & SOF_TELEM_FL_PMW2_WIN3)) {
 		struct {
 			uint32_t resource_id;
@@ -1669,7 +1724,7 @@ static int handle_telem_snapshot(int sock, int cdev_fd, uint32_t req_id,
 		}
 
 		/* Synthesize any missing TLVs from TEL2 and PMW2 windows */
-		synthesize_tlvs_from_windows(snap, tstate);
+		synthesize_tlvs_from_windows(snap, req.query_mask, tstate);
 		if (hot_only) {
 			snap->mem_state_len = 0;
 			memset(snap->mem_state_tlv, 0, sizeof(snap->mem_state_tlv));
