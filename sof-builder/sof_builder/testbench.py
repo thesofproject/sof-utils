@@ -637,6 +637,7 @@ class TestbenchRemoteClient:
         self.cached_modules: Dict[int, str] = dict(WELL_KNOWN_IPC4_MODULES)
         self.cached_hpsram: Optional[SramSegmentState] = None
         self.cached_lpsram: Optional[SramSegmentState] = None
+        self.cached_enabled_cores_mask: int = 0
         # Metadata populated when pipelines/modules are created purely via IPC4 (no -t topology loaded on server)
         self.ipc_widget_map: Dict[int, Tuple[str, int]] = {}  # comp_id -> (widget_name, pipeline_id)
         self.ipc_kcontrols: List[KcontrolTelemetryItem] = []
@@ -1554,6 +1555,8 @@ class TestbenchRemoteClient:
         telem.loaded_modules = dict(self.cached_modules)
 
         # 2. Memory State TLV (HPSRAM / LPSRAM)
+        got_hp_tlv = False
+        got_lp_tlv = False
         if (flags_present & SOF_TELEM_FL_MEM_STATE_TLV) and mem_len > 0:
             m_off = 0
             while m_off + 8 <= len(mem_tlv):
@@ -1583,13 +1586,11 @@ class TestbenchRemoteClient:
                 if ttype == 1 and seg.total_banks > 0:
                     self.cached_hpsram = seg
                     telem.hpsram = seg
+                    got_hp_tlv = True
                 elif ttype == 0 and seg.total_banks > 0:
                     self.cached_lpsram = seg
                     telem.lpsram = seg
-        if telem.hpsram.total_banks == 0 and self.cached_hpsram is not None:
-            telem.hpsram = self.cached_hpsram
-        if telem.lpsram.total_banks == 0 and self.cached_lpsram is not None:
-            telem.lpsram = self.cached_lpsram
+                    got_lp_tlv = True
 
         # 3. Power State TLV
         core_kcps_map: Dict[int, int] = {}
@@ -1605,10 +1606,14 @@ class TestbenchRemoteClient:
                 if ttype == 0 and tlen >= 4:
                     (mask,) = struct.unpack_from("<I", val, 0)
                     telem.enabled_cores_mask = mask
+                    if mask > 0:
+                        self.cached_enabled_cores_mask = mask
                 elif ttype == 1 and tlen >= 4:
                     n = tlen // 4
                     for cid, kv in enumerate(struct.unpack_from(f"<{n}I", val, 0)):
                         core_kcps_map[cid] = kv
+        elif self.cached_enabled_cores_mask > 0:
+            telem.enabled_cores_mask |= self.cached_enabled_cores_mask
 
         # 4. Window 0 FW Regs
         if (flags_present & SOF_TELEM_FL_FW_REGS) and len(fw_regs) >= 20:
@@ -1641,6 +1646,43 @@ class TestbenchRemoteClient:
             telem.cores.append(ct)
 
         # 6. Window 3 & Extended Perf TLV (per-component kcps & cycles)
+        t2_buf = tel2_slot if len(tel2_slot) >= 512 else telem_slot
+        bias = -1
+        if len(t2_buf) >= 0x0100 + 64 and struct.unpack_from("<I", t2_buf, 0x0100)[0] == SOF_TEL_EXT_MAGIC:
+            bias = 0
+        elif len(t2_buf) >= 0x00FC + 64 and struct.unpack_from("<I", t2_buf, 0x00FC)[0] == SOF_TEL_EXT_MAGIC:
+            bias = 4
+
+        default_period_us = 1000
+        if bias >= 0 and len(t2_buf) >= 0x0540 - bias + 400:
+            act_ppls, _ = struct.unpack_from("<HH", t2_buf, 0x0540 - bias)
+            for p_i in range(min(16, act_ppls if act_ppls > 0 else 16)):
+                _pid, _pcore, _pprio, _pst, _pcomp, _pattr, pper = struct.unpack_from(
+                    "<HBBBBHI", t2_buf, 0x0540 - bias + 80 + p_i * 20
+                )
+                if pper > 0:
+                    default_period_us = pper
+                    break
+
+        kcps_by_res: Dict[int, Tuple[int, int]] = {}
+        if (
+            len(pmw2_win3) >= 0x1FC0 + 4
+            and struct.unpack_from("<I", pmw2_win3, 0x1FC0)[0] == SOF_TEL_MW3_MAGIC
+        ):
+            for mi in range(88):
+                poff = mi * 48
+                if poff + 16 > len(pmw2_win3):
+                    break
+                rid, _flg, pk, av = struct.unpack_from("<IIII", pmw2_win3, poff)
+                if rid not in (0, 0xFFFFFFFF):
+                    kcps_by_res[rid] = (pk, av)
+        for off3_k in range(0, len(perf_win3) - 31, 32):
+            rid, _flg, pk, av = struct.unpack_from("<IIII", perf_win3, off3_k)
+            if rid in (0, 0xFFFFFFFF):
+                break
+            if rid not in kcps_by_res:
+                kcps_by_res[rid] = (pk, av)
+
         comp_items: List[ComponentPerfItem] = []
         if (flags_present & SOF_TELEM_FL_EXT_PERF_TLV) and len(ext_perf_tlv) >= 4:
             (count,) = struct.unpack_from("<I", ext_perf_tlv, 0)
@@ -1653,6 +1695,7 @@ class TestbenchRemoteClient:
                 e_stride = 32
             else:
                 e_stride = 16
+            eff_period_us = default_period_us if default_period_us > 0 else 1000
             for _ in range(count):
                 if e_off + e_stride > len(ext_perf_tlv):
                     break
@@ -1667,9 +1710,20 @@ class TestbenchRemoteClient:
                         _r_tot,
                         _r_it,
                     ) = struct.unpack_from("<IIIQQIQQ", ext_perf_tlv, e_off)
-                    avg_cyc = (cycles // max(1, iters)) if iters > 0 else (peak_cyc // 1000)
-                    peak_kcps = peak_cyc // 1000 if peak_cyc >= 1000 else peak_cyc
-                    avg_kcps = int(avg_cyc)
+                    rec_kcps = kcps_by_res.get(res_id)
+                    if rec_kcps is not None and (rec_kcps[0] > 0 or rec_kcps[1] > 0):
+                        peak_kcps, avg_kcps = rec_kcps
+                    else:
+                        peak_kcps = (
+                            int((peak_cyc * 1000) // eff_period_us)
+                            if peak_cyc >= 1000
+                            else int(peak_cyc)
+                        )
+                        avg_kcps = (
+                            int((cycles * 1000) // (iters * eff_period_us))
+                            if iters > 0
+                            else peak_kcps
+                        )
                     is_rem = bool((cflags >> 31) & 1)
                 elif e_stride == 32:
                     res_id, cflags, peak_kcps, avg_kcps, iters, cycles = struct.unpack_from(
@@ -1747,13 +1801,6 @@ class TestbenchRemoteClient:
         telem.components = comp_items
 
         # 7. Extended MW2 Slot 1 ('TEL2') decoding (supports both canonical 0x100 and debugfs -4B 0x0FC)
-        t2_buf = tel2_slot if len(tel2_slot) >= 512 else telem_slot
-        bias = -1
-        if len(t2_buf) >= 0x0100 + 64 and struct.unpack_from("<I", t2_buf, 0x0100)[0] == SOF_TEL_EXT_MAGIC:
-            bias = 0
-        elif len(t2_buf) >= 0x00FC + 64 and struct.unpack_from("<I", t2_buf, 0x00FC)[0] == SOF_TEL_EXT_MAGIC:
-            bias = 4
-
         if bias >= 0:
             _m, _ver, _mc, _nsecs, seq, ts_us = struct.unpack_from("<IBBHII", t2_buf, 0x0100 - bias)
             telem.tel2_present = True
@@ -1781,27 +1828,35 @@ class TestbenchRemoteClient:
                 hp_free, hp_tot, lp_free, lp_tot, ebb_lo, ebb_hi, _lpebb, _r = struct.unpack_from(
                     "<HHHHIIII", t2_buf, 0x0240 - bias
                 )
-                if hp_tot > 0 and telem.hpsram.total_banks == 0:
-                    telem.hpsram.total_banks = (hp_tot + 31) // 32
+                if hp_tot > 0:
                     telem.hpsram.free_phys_pages = hp_free
-                    pwr_hp = bin(ebb_lo).count("1") + bin(ebb_hi).count("1")
-                    telem.hpsram.powered_banks = (
-                        pwr_hp
-                        if pwr_hp >= telem.hpsram.total_banks
-                        else (telem.hpsram.total_banks if hp_free < hp_tot else pwr_hp)
-                    )
-                    telem.hpsram.gated_banks = max(0, telem.hpsram.total_banks - telem.hpsram.powered_banks)
+                    if not got_hp_tlv or telem.hpsram.total_banks == 0:
+                        hp_banks = (hp_tot + 31) // 32
+                        pwr_hp = bin(ebb_lo).count("1") + bin(ebb_hi).count("1")
+                        telem.hpsram.total_banks = hp_banks
+                        telem.hpsram.powered_banks = (
+                            min(hp_banks, pwr_hp)
+                            if pwr_hp > 0
+                            else (hp_banks if hp_free < hp_tot else 0)
+                        )
+                        telem.hpsram.gated_banks = max(
+                            0, telem.hpsram.total_banks - telem.hpsram.powered_banks
+                        )
                     self.cached_hpsram = telem.hpsram
-                if lp_tot > 0 and telem.lpsram.total_banks == 0:
-                    telem.lpsram.total_banks = (lp_tot + 15) // 16
+                if lp_tot > 0:
                     telem.lpsram.free_phys_pages = lp_free
-                    pwr_lp = bin(_lpebb).count("1")
-                    telem.lpsram.powered_banks = (
-                        min(telem.lpsram.total_banks, pwr_lp)
-                        if pwr_lp > 0
-                        else (telem.lpsram.total_banks if lp_free < lp_tot else 0)
-                    )
-                    telem.lpsram.gated_banks = max(0, telem.lpsram.total_banks - telem.lpsram.powered_banks)
+                    if not got_lp_tlv or telem.lpsram.total_banks == 0:
+                        lp_banks = (lp_tot + 15) // 16
+                        pwr_lp = bin(_lpebb).count("1")
+                        telem.lpsram.total_banks = lp_banks
+                        telem.lpsram.powered_banks = (
+                            min(lp_banks, pwr_lp)
+                            if pwr_lp > 0
+                            else (lp_banks if lp_free < lp_tot else 0)
+                        )
+                        telem.lpsram.gated_banks = max(
+                            0, telem.lpsram.total_banks - telem.lpsram.powered_banks
+                        )
                     self.cached_lpsram = telem.lpsram
                 heap_names = {1: "SYS", 2: "SHARED", 3: "LL_USER", 4: "L3_IMR", 5: "DRV_USER"}
                 tot_alloc = 0
@@ -1994,6 +2049,11 @@ class TestbenchRemoteClient:
                                     "perf_usage": iousage,
                                 }
                             )
+
+        if telem.hpsram.total_banks == 0 and self.cached_hpsram is not None:
+            telem.hpsram = self.cached_hpsram
+        if telem.lpsram.total_banks == 0 and self.cached_lpsram is not None:
+            telem.lpsram = self.cached_lpsram
 
         self._log(
             f"[SOFR] OP_TELEM_SNAPSHOT -> ticks={telem.total_ll_ticks} "

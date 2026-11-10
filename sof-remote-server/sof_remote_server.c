@@ -1205,6 +1205,7 @@ static void synthesize_modules_info_from_fw(struct sof_net_telem_snapshot *snap)
 
 struct client_telem_state {
 	uint32_t prev_core_ticks[SOF_TEL_MAX_CORES];
+	uint32_t last_pwr_core_mask;
 	bool     has_prev_core_ticks;
 };
 
@@ -1281,10 +1282,20 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 	}
 
 	/* 1. Synthesize pwr_state_tlv & enabled_cores_mask from TEL2 */
-	if ((query_mask & SOF_TELEM_FL_PWR_STATE_TLV) &&
-	    !(snap->flags_present & SOF_TELEM_FL_PWR_STATE_TLV) &&
-	    (snap->flags_present & SOF_TELEM_FL_TELEM_SLOT)) {
-		uint32_t core_mask = 1;
+	if ((snap->flags_present & SOF_TELEM_FL_PWR_STATE_TLV) &&
+	    snap->pwr_state_len >= 12) {
+		uint32_t t0_type = 0, t0_len = 0, t0_mask = 0;
+		memcpy(&t0_type, snap->pwr_state_tlv + 0, 4);
+		memcpy(&t0_len, snap->pwr_state_tlv + 4, 4);
+		if (t0_type == 0 && t0_len >= 4) {
+			memcpy(&t0_mask, snap->pwr_state_tlv + 8, 4);
+			if (t0_mask != 0) {
+				tstate->last_pwr_core_mask = t0_mask;
+				snap->dev_info.enabled_cores_mask = t0_mask;
+			}
+		}
+	} else if (snap->flags_present & SOF_TELEM_FL_TELEM_SLOT) {
+		uint32_t core_mask = 1U | tstate->last_pwr_core_mask;
 		uint32_t core_kcps[SOF_TEL_MAX_CORES] = {0};
 		uint32_t ncores = snap->dev_info.num_cores ?
 				  snap->dev_info.num_cores : SOF_TEL_MAX_CORES;
@@ -1300,17 +1311,19 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 		}
 		snap->dev_info.enabled_cores_mask = core_mask;
 
-		uint32_t off = 0;
-		uint32_t t0_type = 0, t0_len = 4;
-		uint32_t t1_type = 1, t1_len = ncores * 4;
-		memcpy(snap->pwr_state_tlv + off, &t0_type, 4); off += 4;
-		memcpy(snap->pwr_state_tlv + off, &t0_len, 4);  off += 4;
-		memcpy(snap->pwr_state_tlv + off, &core_mask, 4); off += 4;
-		memcpy(snap->pwr_state_tlv + off, &t1_type, 4); off += 4;
-		memcpy(snap->pwr_state_tlv + off, &t1_len, 4);  off += 4;
-		memcpy(snap->pwr_state_tlv + off, core_kcps, t1_len); off += t1_len;
-		snap->pwr_state_len = off;
-		snap->flags_present |= SOF_TELEM_FL_PWR_STATE_TLV;
+		if (query_mask & SOF_TELEM_FL_PWR_STATE_TLV) {
+			uint32_t off = 0;
+			uint32_t t0_type = 0, t0_len = 4;
+			uint32_t t1_type = 1, t1_len = ncores * 4;
+			memcpy(snap->pwr_state_tlv + off, &t0_type, 4); off += 4;
+			memcpy(snap->pwr_state_tlv + off, &t0_len, 4);  off += 4;
+			memcpy(snap->pwr_state_tlv + off, &core_mask, 4); off += 4;
+			memcpy(snap->pwr_state_tlv + off, &t1_type, 4); off += 4;
+			memcpy(snap->pwr_state_tlv + off, &t1_len, 4);  off += 4;
+			memcpy(snap->pwr_state_tlv + off, core_kcps, t1_len); off += t1_len;
+			snap->pwr_state_len = off;
+			snap->flags_present |= SOF_TELEM_FL_PWR_STATE_TLV;
+		}
 	}
 
 	/* 2. Synthesize or patch mem_state_tlv when requested and TEL2 mem_sec.sram is present */
@@ -1319,6 +1332,7 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 		uint32_t pgctl[3] = { 0xFFFFFFFFU, 0xFFFFFFFFU, 0xFFFFFFFFU };
 		uint32_t lp_tot_pages = 0, lp_free_pages = 0, lp_banks = 0;
 		uint32_t lp_pgctl = 0xFFFFFFFFU;
+		bool has_tel2_hp_mask = false;
 
 		if (bias >= 0 &&
 		    SOF_TEL_OFF_MEM_SEC - (uint32_t)bias + sizeof(struct sof_tel_mem_section) <=
@@ -1329,6 +1343,8 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 			hp_tot_pages = ms->sram.hp_sram_total_pages;
 			hp_free_pages = ms->sram.hp_sram_free_pages;
 			hp_banks = (hp_tot_pages + 31U) / 32U;
+			has_tel2_hp_mask = (ms->sram.ebb_power_mask_lo != 0 ||
+					    ms->sram.ebb_power_mask_hi != 0);
 			pgctl[0] = ~ms->sram.ebb_power_mask_lo;
 			pgctl[1] = ~ms->sram.ebb_power_mask_hi;
 			lp_tot_pages = ms->sram.lp_sram_total_pages;
@@ -1383,14 +1399,15 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 				snap->mem_state_len = off;
 				snap->flags_present |= SOF_TELEM_FL_MEM_STATE_TLV;
 			}
-		} else if (lp_banks > 0 && lp_banks <= 32 && snap->mem_state_len >= 8) {
+		} else if (snap->mem_state_len >= 8) {
 			/*
-			 * On platforms where LPSRAM is 64 KB (1 bank) and basefw_mem_state_info
-			 * divides 64 KB by SRAM_BANK_SIZE (128 KB) == 0, the IPC4 LPSRAM tuple
-			 * reports 0 banks. Patch or append the LPSRAM tuple from TEL2.
+			 * Patch IPC4 memory-state tuples with TEL2 live per-bank HSxPGISTS /
+			 * USxPGISTS masks and free-page counts when basefw_mem_state_info
+			 * only sampled bank 0's HSxPGCTL or reported 0 LPSRAM banks.
 			 */
 			uint32_t off = 0;
 			uint32_t hp_end = 0;
+			bool lp_present = false;
 			bool lp_valid = false;
 			while (off + 8 <= snap->mem_state_len) {
 				uint32_t ttype = 0, tlen = 0;
@@ -1400,8 +1417,23 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 					break;
 				if (ttype == 1) {
 					hp_end = off + 8 + tlen;
+					if (hp_banks > 0 && tlen >= 12) {
+						uint32_t ebb_dw = 0;
+						memcpy(snap->mem_state_tlv + off + 8,
+						       &hp_free_pages, 4);
+						memcpy(&ebb_dw,
+						       snap->mem_state_tlv + off + 12, 4);
+						if (has_tel2_hp_mask && ebb_dw <= 3 &&
+						    8 + ebb_dw * 4 <= tlen) {
+							for (uint32_t d = 0; d < ebb_dw; d++) {
+								memcpy(snap->mem_state_tlv + off +
+								       16 + d * 4, &pgctl[d], 4);
+							}
+						}
+					}
 				} else if (ttype == 0 && tlen >= 12) {
 					uint32_t ebb_dw = 0, bcnt = 0;
+					lp_present = true;
 					memcpy(&ebb_dw, snap->mem_state_tlv + off + 12, 4);
 					if (ebb_dw <= 8 && 12 + ebb_dw * 4 <= tlen)
 						memcpy(&bcnt, snap->mem_state_tlv + off + 16 + ebb_dw * 4, 4);
@@ -1410,7 +1442,17 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 				}
 				off += 8 + tlen;
 			}
-			if (!lp_valid && hp_end > 0 &&
+			if (!lp_valid && lp_banks == 0 && lp_present) {
+				/*
+				 * basefw_mem_state_info emitted an IPC4_LPSRAM_STATE tuple
+				 * with 0 banks (64 KB sram1 / 128 KB SRAM_BANK_SIZE == 0).
+				 */
+				lp_banks = 1U;
+				lp_tot_pages = 16U;
+				lp_free_pages = 0U;
+				lp_pgctl = ~1U;
+			}
+			if (!lp_valid && lp_banks > 0 && lp_banks <= 32 && hp_end > 0 &&
 			    hp_end + 24U + lp_banks * 2U <= sizeof(snap->mem_state_tlv)) {
 				uint32_t p_off = hp_end;
 				uint32_t lp_type = 0; /* LPSRAM */

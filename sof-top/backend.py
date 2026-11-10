@@ -587,6 +587,7 @@ class TelemetryParser:
         self.cached_hpsram: Optional[SramSegmentState] = None
         self.cached_lpsram: Optional[SramSegmentState] = None
         self.cached_core_kcps: Dict[int, int] = {}
+        self.cached_enabled_cores_mask: int = 0
         self.cached_ext_perf: List[ComponentPerfItem] = []
 
     def lookup_module_name(self, mod_id: int) -> str:
@@ -669,7 +670,9 @@ class TelemetryParser:
                 self.module_name_lookup[idx] = mname
             off += 116
 
-    def parse_memory_state_tlv(self, data: bytes):
+    def parse_memory_state_tlv(self, data: bytes) -> Tuple[bool, bool]:
+        got_hp = False
+        got_lp = False
         off = 0
         while off + 8 <= len(data):
             ttype, tlen = struct.unpack_from("<II", data, off)
@@ -715,8 +718,11 @@ class TelemetryParser:
 
             if ttype == 1 and seg.total_banks > 0:
                 self.cached_hpsram = seg
+                got_hp = True
             elif ttype == 0 and seg.total_banks > 0:
                 self.cached_lpsram = seg
+                got_lp = True
+        return got_hp, got_lp
 
     def parse_power_state_tlv(self, data: bytes, snap: TelemetrySnapshot):
         off = 0
@@ -730,13 +736,59 @@ class TelemetryParser:
             if ttype == 0 and tlen >= 4:
                 (mask,) = struct.unpack_from("<I", val, 0)
                 snap.enabled_cores_mask = mask
+                if mask > 0:
+                    self.cached_enabled_cores_mask = mask
             elif ttype == 1 and tlen >= 4:
                 n = tlen // 4
                 kcps_arr = struct.unpack_from(f"<{n}I", val, 0)
                 for cid, kv in enumerate(kcps_arr):
                     self.cached_core_kcps[cid] = kv
 
-    def parse_ext_perf_tlv(self, data: bytes):
+    @staticmethod
+    def _extract_kcps_records(
+        perf_win3: bytes, pmw2_win3: bytes
+    ) -> Dict[int, Tuple[int, int]]:
+        kcps_map: Dict[int, Tuple[int, int]] = {}
+        if len(pmw2_win3) >= SOF_TEL_MW3_HDR_OFFSET + 4:
+            (mw3_magic,) = struct.unpack_from("<I", pmw2_win3, SOF_TEL_MW3_HDR_OFFSET)
+            if mw3_magic == SOF_TEL_MW3_MAGIC:
+                for i in range(SOF_TEL_MW3_MAX_COMP_ITEMS):
+                    poff = i * SOF_TEL_MW3_COMP_PERF_STRIDE
+                    if poff + 16 > len(pmw2_win3):
+                        break
+                    rid, _flg, pk, av = struct.unpack_from("<IIII", pmw2_win3, poff)
+                    if rid not in (0, 0xFFFFFFFF):
+                        kcps_map[rid] = (pk, av)
+        for off in range(0, len(perf_win3) - 31, 32):
+            rid, _flg, pk, av = struct.unpack_from("<IIII", perf_win3, off)
+            if rid in (0, 0xFFFFFFFF):
+                break
+            if rid not in kcps_map:
+                kcps_map[rid] = (pk, av)
+        return kcps_map
+
+    @staticmethod
+    def _extract_default_period_us(tel2: bytes) -> int:
+        bias = sof_tel2_slot_bias(tel2)
+        if bias >= 0:
+            ppl_off = SOF_TEL_OFF_PPL_SEC - bias
+            if ppl_off + 400 <= len(tel2):
+                act_ppls, _ = struct.unpack_from("<HH", tel2, ppl_off)
+                for p_i in range(min(16, act_ppls if act_ppls > 0 else 16)):
+                    poff = ppl_off + 80 + p_i * 20
+                    _pid, _pcore, _pprio, _pst, _pcomp, _pattr, pper = struct.unpack_from(
+                        "<HBBBBHI", tel2, poff
+                    )
+                    if pper > 0:
+                        return pper
+        return 1000
+
+    def parse_ext_perf_tlv(
+        self,
+        data: bytes,
+        kcps_by_res: Optional[Dict[int, Tuple[int, int]]] = None,
+        period_us: int = 1000,
+    ):
         if len(data) < 4:
             return
         (count,) = struct.unpack_from("<I", data, 0)
@@ -755,6 +807,7 @@ class TelemetryParser:
         else:
             stride = 16
 
+        eff_period_us = period_us if period_us > 0 else 1000
         for _ in range(count):
             if off + stride > len(data):
                 break
@@ -769,9 +822,20 @@ class TelemetryParser:
                     _r_tot,
                     _r_it,
                 ) = struct.unpack_from("<IIIQQIQQ", data, off)
-                avg_cyc = (total_cyc // max(1, iters)) if iters > 0 else (peak_cyc // 1000)
-                peak_kcps = peak_cyc // 1000 if peak_cyc >= 1000 else peak_cyc
-                avg_kcps = int(avg_cyc)
+                rec_kcps = kcps_by_res.get(res_id) if kcps_by_res else None
+                if rec_kcps is not None and (rec_kcps[0] > 0 or rec_kcps[1] > 0):
+                    peak_kcps, avg_kcps = rec_kcps
+                else:
+                    peak_kcps = (
+                        int((peak_cyc * 1000) // eff_period_us)
+                        if peak_cyc >= 1000
+                        else int(peak_cyc)
+                    )
+                    avg_kcps = (
+                        int((total_cyc * 1000) // (iters * eff_period_us))
+                        if iters > 0
+                        else peak_kcps
+                    )
                 cycles = total_cyc
             elif stride == 32:
                 res_id, flags, peak_kcps, avg_kcps, iters, cycles = struct.unpack_from(
@@ -813,7 +877,14 @@ class TelemetryParser:
             )
         self.cached_ext_perf = items
 
-    def parse_tel2_and_pmw2(self, tel2: bytes, pmw2: bytes, snap: TelemetrySnapshot):
+    def parse_tel2_and_pmw2(
+        self,
+        tel2: bytes,
+        pmw2: bytes,
+        snap: TelemetrySnapshot,
+        got_hp_tlv: bool = False,
+        got_lp_tlv: bool = False,
+    ):
         """Parse Extended Telemetry v2 (TEL2 4KB slot & PMW2 8KB window)."""
         bias = sof_tel2_slot_bias(tel2)
         if bias >= 0:
@@ -868,26 +939,29 @@ class TelemetryParser:
                 if hp_tot > 0:
                     snap.hpsram.total_phys_pages = hp_tot
                     snap.hpsram.free_phys_pages = hp_free
-                    if snap.hpsram.total_banks == 0:
+                    if not got_hp_tlv or snap.hpsram.total_banks == 0:
                         hp_banks = (hp_tot + 31) // 32
                         pwr_hp = bin(ebb_lo).count("1") + bin(ebb_hi).count("1")
                         snap.hpsram.total_banks = hp_banks
                         snap.hpsram.powered_banks = (
-                            pwr_hp
-                            if pwr_hp >= hp_banks
-                            else (hp_banks if hp_free < hp_tot else pwr_hp)
+                            min(hp_banks, pwr_hp)
+                            if pwr_hp > 0
+                            else (hp_banks if hp_free < hp_tot else 0)
                         )
                         snap.hpsram.gated_banks = max(
                             0, snap.hpsram.total_banks - snap.hpsram.powered_banks
                         )
                         snap.hpsram.bank_powered = [
-                            b < snap.hpsram.powered_banks for b in range(hp_banks)
+                            bool(((ebb_lo if b < 32 else ebb_hi) >> (b % 32)) & 1)
+                            if pwr_hp > 0
+                            else (b < snap.hpsram.powered_banks)
+                            for b in range(hp_banks)
                         ]
-                        self.cached_hpsram = snap.hpsram
+                    self.cached_hpsram = snap.hpsram
                 if lp_tot > 0:
                     snap.lpsram.total_phys_pages = lp_tot
                     snap.lpsram.free_phys_pages = lp_free
-                    if snap.lpsram.total_banks == 0:
+                    if not got_lp_tlv or snap.lpsram.total_banks == 0:
                         lp_banks = (lp_tot + 15) // 16
                         pwr_lp = bin(lp_ebb).count("1")
                         snap.lpsram.total_banks = lp_banks
@@ -900,9 +974,12 @@ class TelemetryParser:
                             0, snap.lpsram.total_banks - snap.lpsram.powered_banks
                         )
                         snap.lpsram.bank_powered = [
-                            b < snap.lpsram.powered_banks for b in range(lp_banks)
+                            bool((lp_ebb >> b) & 1)
+                            if pwr_lp > 0
+                            else (b < snap.lpsram.powered_banks)
+                            for b in range(lp_banks)
                         ]
-                        self.cached_lpsram = snap.lpsram
+                    self.cached_lpsram = snap.lpsram
 
                 # Heaps[6] (each 20B at mem_off + 24)
                 snap.heaps = []
@@ -1416,19 +1493,26 @@ class TelemetryParser:
             self.parse_modules_info_tlv(mod_info_tlv)
         snap.loaded_modules = dict(self.cached_modules)
 
+        got_hp_tlv = False
+        got_lp_tlv = False
         if (flags_present & SOF_TELEM_FL_MEM_STATE_TLV) and mem_len > 0:
-            self.parse_memory_state_tlv(mem_tlv)
+            got_hp_tlv, got_lp_tlv = self.parse_memory_state_tlv(mem_tlv)
+            if got_hp_tlv and self.cached_hpsram:
+                snap.hpsram = self.cached_hpsram
+            if got_lp_tlv and self.cached_lpsram:
+                snap.lpsram = self.cached_lpsram
 
         if (flags_present & SOF_TELEM_FL_PWR_STATE_TLV) and pwr_len > 0:
             self.parse_power_state_tlv(pwr_tlv, snap)
+        elif self.cached_enabled_cores_mask > 0:
+            snap.enabled_cores_mask |= self.cached_enabled_cores_mask
 
         if (flags_present & SOF_TELEM_FL_EXT_PERF_TLV) and ext_perf_len > 0:
-            self.parse_ext_perf_tlv(ext_perf_tlv)
-
-        if self.cached_hpsram:
-            snap.hpsram = self.cached_hpsram
-        if self.cached_lpsram:
-            snap.lpsram = self.cached_lpsram
+            kcps_by_res = self._extract_kcps_records(perf_win3, pmw2_win3)
+            period_us = self._extract_default_period_us(
+                tel2_slot if len(tel2_slot) >= 512 else telem_slot
+            )
+            self.parse_ext_perf_tlv(ext_perf_tlv, kcps_by_res=kcps_by_res, period_us=period_us)
 
         # Parse Window 0 FW Regs
         if flags_present & SOF_TELEM_FL_FW_REGS:
@@ -1553,7 +1637,18 @@ class TelemetryParser:
 
         # Parse Extended TEL2 (MW2 Slot 1) and PMW2 (MW3) if present
         if tel2_slot or pmw2_win3:
-            self.parse_tel2_and_pmw2(tel2_slot, pmw2_win3, snap)
+            self.parse_tel2_and_pmw2(
+                tel2_slot,
+                pmw2_win3,
+                snap,
+                got_hp_tlv=got_hp_tlv,
+                got_lp_tlv=got_lp_tlv,
+            )
+
+        if snap.hpsram.total_banks == 0 and self.cached_hpsram:
+            snap.hpsram = self.cached_hpsram
+        if snap.lpsram.total_banks == 0 and self.cached_lpsram:
+            snap.lpsram = self.cached_lpsram
 
         for it in snap.components:
             if it.avg_kcps > clock_khz * 2:
