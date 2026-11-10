@@ -12,8 +12,21 @@
 #include <string.h>
 #include <math.h>
 #include <errno.h>
+
+#if !defined(__ANDROID__) && !defined(NO_ALSA) && !defined(HAVE_ALSA)
+#if defined(__has_include)
+#if __has_include(<alsa/asoundlib.h>)
+#define HAVE_ALSA 1
+#endif
+#else
+#define HAVE_ALSA 1
+#endif
+#endif
+
+#ifdef HAVE_ALSA
 #include <alsa/asoundlib.h>
 #include <sound/tlv.h>
+#endif
 
 #include "audio_backends.h"
 
@@ -66,19 +79,6 @@ const char *sof_pcm_fmt_name(uint32_t fmt_id)
 	case SOF_PCM_FMT_S32_LE:   return "S32_LE";
 	case SOF_PCM_FMT_FLOAT_LE: return "FLOAT_LE";
 	default:                   return "S16_LE";
-	}
-}
-
-static snd_pcm_format_t sof_to_alsa_format(uint32_t fmt_id)
-{
-	switch (fmt_id) {
-	case SOF_PCM_FMT_S8:       return SND_PCM_FORMAT_S8;
-	case SOF_PCM_FMT_S24_LE:   return SND_PCM_FORMAT_S24_LE;
-	case SOF_PCM_FMT_S24_3LE:  return SND_PCM_FORMAT_S24_3LE;
-	case SOF_PCM_FMT_S32_LE:   return SND_PCM_FORMAT_S32_LE;
-	case SOF_PCM_FMT_FLOAT_LE: return SND_PCM_FORMAT_FLOAT_LE;
-	case SOF_PCM_FMT_S16_LE:
-	default:                   return SND_PCM_FORMAT_S16_LE;
 	}
 }
 
@@ -149,6 +149,111 @@ void sof_rate_mask_to_str(uint32_t mask, uint32_t rmin, uint32_t rmax,
 		snprintf(buf, cap, "%u..%u", rmin, rmax);
 	else if (!off)
 		snprintf(buf, cap, "NONE");
+}
+
+void sof_compute_pcm_rms_peak(const void *buf, uint32_t fmt_id, size_t n_samp,
+			      uint32_t *rms_out, uint32_t *peak_out)
+{
+	double sum_sq = 0.0;
+	uint32_t peak = 0;
+
+	if (buf && n_samp > 0) {
+		switch (fmt_id) {
+		case SOF_PCM_FMT_S8: {
+			const int8_t *s = (const int8_t *)buf;
+			for (size_t i = 0; i < n_samp; i++) {
+				int32_t v = (int32_t)s[i] * 256;
+				uint32_t av = (uint32_t)(v < 0 ? -v : v);
+				if (av > peak)
+					peak = av;
+				sum_sq += (double)v * (double)v;
+			}
+			break;
+		}
+		case SOF_PCM_FMT_S24_LE: {
+			const uint32_t *s = (const uint32_t *)buf;
+			for (size_t i = 0; i < n_samp; i++) {
+				uint32_t u24 = s[i] & 0x00FFFFFFU;
+				int32_t v24 = (u24 & 0x00800000U) ?
+					      ((int32_t)u24 - 0x01000000) : (int32_t)u24;
+				int32_t v = v24 >> 8;
+				uint32_t av = (uint32_t)(v < 0 ? -v : v);
+				if (av > peak)
+					peak = av;
+				sum_sq += (double)v * (double)v;
+			}
+			break;
+		}
+		case SOF_PCM_FMT_S24_3LE: {
+			const uint8_t *p = (const uint8_t *)buf;
+			for (size_t i = 0; i < n_samp; i++) {
+				int32_t u24 = (int32_t)p[i * 3] |
+					      ((int32_t)p[i * 3 + 1] << 8) |
+					      ((int32_t)(int8_t)p[i * 3 + 2] * 65536);
+				int32_t v = u24 >> 8;
+				uint32_t av = (uint32_t)(v < 0 ? -v : v);
+				if (av > peak)
+					peak = av;
+				sum_sq += (double)v * (double)v;
+			}
+			break;
+		}
+		case SOF_PCM_FMT_S32_LE: {
+			const int32_t *s = (const int32_t *)buf;
+			for (size_t i = 0; i < n_samp; i++) {
+				int64_t v = (int64_t)s[i] >> 16;
+				uint32_t av = (uint32_t)(v < 0 ? -v : v);
+				if (av > peak)
+					peak = av;
+				sum_sq += (double)v * (double)v;
+			}
+			break;
+		}
+		case SOF_PCM_FMT_FLOAT_LE: {
+			const float *f = (const float *)buf;
+			for (size_t i = 0; i < n_samp; i++) {
+				double v = (double)f[i] * 32767.0;
+				uint32_t av = (uint32_t)(v < 0.0 ? -v : v);
+				if (av > peak)
+					peak = av;
+				sum_sq += v * v;
+			}
+			break;
+		}
+		case SOF_PCM_FMT_S16_LE:
+		default: {
+			const int16_t *s = (const int16_t *)buf;
+			for (size_t i = 0; i < n_samp; i++) {
+				int32_t v = s[i];
+				uint32_t av = (uint32_t)(v < 0 ? -v : v);
+				if (av > peak)
+					peak = av;
+				sum_sq += (double)v * (double)v;
+			}
+			break;
+		}
+		}
+	}
+
+	if (rms_out)
+		*rms_out = n_samp ? (uint32_t)sqrt(sum_sq / (double)n_samp) : 0;
+	if (peak_out)
+		*peak_out = peak;
+}
+
+#ifdef HAVE_ALSA
+
+static snd_pcm_format_t sof_to_alsa_format(uint32_t fmt_id)
+{
+	switch (fmt_id) {
+	case SOF_PCM_FMT_S8:       return SND_PCM_FORMAT_S8;
+	case SOF_PCM_FMT_S24_LE:   return SND_PCM_FORMAT_S24_LE;
+	case SOF_PCM_FMT_S24_3LE:  return SND_PCM_FORMAT_S24_3LE;
+	case SOF_PCM_FMT_S32_LE:   return SND_PCM_FORMAT_S32_LE;
+	case SOF_PCM_FMT_FLOAT_LE: return SND_PCM_FORMAT_FLOAT_LE;
+	case SOF_PCM_FMT_S16_LE:
+	default:                   return SND_PCM_FORMAT_S16_LE;
+	}
 }
 
 /* -------------------------------------------------------------------------
@@ -360,96 +465,6 @@ static void synthesize_sine_period(void *buf, uint32_t fmt_id, uint32_t frames,
 		}
 	}
 	*phase_inout = phase;
-}
-
-void sof_compute_pcm_rms_peak(const void *buf, uint32_t fmt_id, size_t n_samp,
-			      uint32_t *rms_out, uint32_t *peak_out)
-{
-	double sum_sq = 0.0;
-	uint32_t peak = 0;
-
-	if (buf && n_samp > 0) {
-		switch (fmt_id) {
-		case SOF_PCM_FMT_S8: {
-			const int8_t *s = (const int8_t *)buf;
-			for (size_t i = 0; i < n_samp; i++) {
-				int32_t v = (int32_t)s[i] * 256;
-				uint32_t av = (uint32_t)(v < 0 ? -v : v);
-				if (av > peak)
-					peak = av;
-				sum_sq += (double)v * (double)v;
-			}
-			break;
-		}
-		case SOF_PCM_FMT_S24_LE: {
-			const uint32_t *s = (const uint32_t *)buf;
-			for (size_t i = 0; i < n_samp; i++) {
-				uint32_t u24 = s[i] & 0x00FFFFFFU;
-				int32_t v24 = (u24 & 0x00800000U) ?
-					      ((int32_t)u24 - 0x01000000) : (int32_t)u24;
-				int32_t v = v24 >> 8;
-				uint32_t av = (uint32_t)(v < 0 ? -v : v);
-				if (av > peak)
-					peak = av;
-				sum_sq += (double)v * (double)v;
-			}
-			break;
-		}
-		case SOF_PCM_FMT_S24_3LE: {
-			const uint8_t *p = (const uint8_t *)buf;
-			for (size_t i = 0; i < n_samp; i++) {
-				int32_t u24 = (int32_t)p[i * 3] |
-					      ((int32_t)p[i * 3 + 1] << 8) |
-					      ((int32_t)(int8_t)p[i * 3 + 2] * 65536);
-				int32_t v = u24 >> 8;
-				uint32_t av = (uint32_t)(v < 0 ? -v : v);
-				if (av > peak)
-					peak = av;
-				sum_sq += (double)v * (double)v;
-			}
-			break;
-		}
-		case SOF_PCM_FMT_S32_LE: {
-			const int32_t *s = (const int32_t *)buf;
-			for (size_t i = 0; i < n_samp; i++) {
-				int64_t v = (int64_t)s[i] >> 16;
-				uint32_t av = (uint32_t)(v < 0 ? -v : v);
-				if (av > peak)
-					peak = av;
-				sum_sq += (double)v * (double)v;
-			}
-			break;
-		}
-		case SOF_PCM_FMT_FLOAT_LE: {
-			const float *f = (const float *)buf;
-			for (size_t i = 0; i < n_samp; i++) {
-				double v = (double)f[i] * 32767.0;
-				uint32_t av = (uint32_t)(v < 0.0 ? -v : v);
-				if (av > peak)
-					peak = av;
-				sum_sq += v * v;
-			}
-			break;
-		}
-		case SOF_PCM_FMT_S16_LE:
-		default: {
-			const int16_t *s = (const int16_t *)buf;
-			for (size_t i = 0; i < n_samp; i++) {
-				int32_t v = s[i];
-				uint32_t av = (uint32_t)(v < 0 ? -v : v);
-				if (av > peak)
-					peak = av;
-				sum_sq += (double)v * (double)v;
-			}
-			break;
-		}
-		}
-	}
-
-	if (rms_out)
-		*rms_out = n_samp ? (uint32_t)sqrt(sum_sq / (double)n_samp) : 0;
-	if (peak_out)
-		*peak_out = peak;
 }
 
 static int configure_alsa_pcm(snd_pcm_t *pcm, uint32_t fmt_id, uint32_t rate,
@@ -1109,3 +1124,65 @@ int alsa_kctl_set(const struct sof_net_kctl_io_req *req,
 	rsp->status = err < 0 ? err : 0;
 	return rsp->status;
 }
+
+#else /* !HAVE_ALSA — Forward alsa_* calls to TinyALSA (e.g. Android / Bionic) */
+
+int alsa_query_pcm_caps(uint32_t card_id, uint32_t dev_id, uint32_t direction,
+			struct sof_net_pcm_caps *out)
+{
+	return tinyalsa_query_pcm_caps(card_id, dev_id, direction, out);
+}
+
+int alsa_pcm_play_frames(const char *dev_name, uint32_t fmt_id, uint32_t rate,
+			 uint32_t channels, uint32_t period_size,
+			 uint32_t period_count, const void *pcm_data,
+			 uint32_t total_frames, _Atomic bool *keep_running,
+			 uint32_t freq_hz, _Atomic uint64_t *frames_counter,
+			 _Atomic uint32_t *rms_out, _Atomic uint32_t *peak_out,
+			 uint32_t *xruns_out)
+{
+	uint32_t card_id = 0, dev_id = 0;
+
+	sof_parse_card_dev(dev_name, &card_id, &dev_id);
+	return tinyalsa_pcm_play_frames(card_id, dev_id, fmt_id, rate, channels,
+					period_size, period_count, pcm_data,
+					total_frames, keep_running, freq_hz,
+					frames_counter, rms_out, peak_out,
+					xruns_out);
+}
+
+int alsa_pcm_capture_frames(const char *dev_name, uint32_t fmt_id, uint32_t rate,
+			    uint32_t channels, uint32_t period_size,
+			    uint32_t period_count, void *out_buf,
+			    uint32_t max_frames, uint32_t *frames_read_out,
+			    uint32_t *rms_out, uint32_t *peak_out,
+			    uint32_t *xruns_out)
+{
+	uint32_t card_id = 0, dev_id = 0;
+
+	sof_parse_card_dev(dev_name, &card_id, &dev_id);
+	return tinyalsa_pcm_capture_frames(card_id, dev_id, fmt_id, rate, channels,
+					   period_size, period_count, out_buf,
+					   max_frames, frames_read_out,
+					   rms_out, peak_out, xruns_out);
+}
+
+int alsa_kctl_list(uint32_t card_id, struct sof_net_kctl_info *out_arr,
+		   uint32_t max_items, uint32_t *count_out)
+{
+	return tinyalsa_kctl_list(card_id, out_arr, max_items, count_out);
+}
+
+int alsa_kctl_get(const struct sof_net_kctl_io_req *req,
+		  struct sof_net_kctl_io_rsp *rsp)
+{
+	return tinyalsa_kctl_get(req, rsp);
+}
+
+int alsa_kctl_set(const struct sof_net_kctl_io_req *req,
+		  struct sof_net_kctl_io_rsp *rsp)
+{
+	return tinyalsa_kctl_set(req, rsp);
+}
+
+#endif /* HAVE_ALSA */

@@ -65,6 +65,7 @@ DEB_FILE     := $(DIST_DIR)/$(PACKAGE)_$(VERSION)-$(RELEASE)_$(DEB_ARCH).deb
 RPM_TOPDIR   := $(abspath $(BUILD_DIR)/rpmbuild)
 
 .PHONY: all build remote-server builder top testbench \
+        android android-push \
         install uninstall check test ctest \
         deb rpm package packages clean distclean help
 
@@ -74,6 +75,12 @@ build: remote-server builder top testbench
 
 remote-server:
 	$(MAKE) -C sof-remote-server WORK_DIR="$(WORK_DIR)" all
+
+android:
+	$(MAKE) -C sof-remote-server WORK_DIR="$(WORK_DIR)" android
+
+android-push:
+	$(MAKE) -C sof-remote-server WORK_DIR="$(WORK_DIR)" android-push
 
 builder:
 	$(MAKE) -C sof-builder PYTHON="$(PYTHON)" all
@@ -197,6 +204,7 @@ rpm:
 		--exclude='/dist' \
 		--exclude='/.git' \
 		--exclude='/sof-testbench/build' \
+		--exclude='build-android-*' \
 		--exclude='__pycache__' \
 		--exclude='*.pyc' \
 		--exclude='*.o' \
@@ -238,4 +246,6 @@ help:
 	@echo "  make deb                  - Build Debian package in dist/*.deb"
 	@echo "  make rpm                  - Build RPM package in dist/*.rpm"
 	@echo "  make packages             - Build both .deb and .rpm packages in dist/"
+	@echo "  make android              - Cross-compile sof_remote_server & sof-remote for Android (NDK/AOSP)"
+	@echo "  make android-push         - Build, adb push to /data/local/tmp/, and forward TCP port 9998"
 	@echo "  make clean / distclean    - Clean build artifacts"

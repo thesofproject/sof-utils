@@ -27,6 +27,9 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #include "sof_remote_proto.h"
 #include "audio_backends.h"
@@ -51,7 +54,11 @@ static char g_tone_device[32] = "hw:0,0";
 static uint32_t g_tone_rate = 48000;
 static uint32_t g_tone_channels = 2;
 static uint32_t g_tone_freq = 1000;
+#if defined(__ANDROID__) || defined(NO_ALSA)
+static uint32_t g_tone_api = SOF_AUDIO_API_TINYALSA;
+#else
 static uint32_t g_tone_api = SOF_AUDIO_API_ALSA;
+#endif
 static uint32_t g_tone_fmt = SOF_PCM_FMT_S16_LE;
 static uint32_t g_tone_period_size = 1024;
 static uint32_t g_tone_period_count = 4;
@@ -506,6 +513,8 @@ static int read_debugfs_fw_state(void)
 {
 	int fd = open("/sys/kernel/debug/sof/fw_state", O_RDONLY);
 	if (fd < 0)
+		fd = open("/d/sof/fw_state", O_RDONLY);
+	if (fd < 0)
 		return -1;
 	uint32_t state = 0;
 	ssize_t n = read(fd, &state, sizeof(state));
@@ -819,6 +828,8 @@ static int read_telemetry_slot_len(int cdev_fd, uint32_t win_flags,
 
 	/* 1. Try /sys/kernel/debug/sof/exception first (fastest, kernel debugfs) */
 	int dfd = open("/sys/kernel/debug/sof/exception", O_RDONLY);
+	if (dfd < 0)
+		dfd = open("/d/sof/exception", O_RDONLY);
 	if (dfd >= 0) {
 		uint8_t raw[4096];
 		memset(raw, 0, max_bytes);
@@ -923,6 +934,8 @@ static int populate_direct_cdev_info(struct sof_cdev_info *info)
 
 	if (info->fw_state == 7) {
 		FILE *vfp = fopen("/sys/kernel/debug/sof/fw_version", "r");
+		if (!vfp)
+			vfp = fopen("/d/sof/fw_version", "r");
 		if (vfp) {
 			unsigned int maj = 0, min = 0, mic = 0, bld = 0;
 			char vline[128];
@@ -1137,21 +1150,37 @@ static void synthesize_modules_info_from_fw(struct sof_net_telem_snapshot *snap)
 		char fw_name[64] = "sof-ptl.ri";
 		read_file_first_line("/sys/kernel/debug/sof/fw_profile/fw_path",
 				     fw_dir, sizeof(fw_dir));
+		read_file_first_line("/d/sof/fw_profile/fw_path",
+				     fw_dir, sizeof(fw_dir));
 		read_file_first_line("/sys/kernel/debug/sof/fw_profile/fw_name",
 				     fw_name, sizeof(fw_name));
+		read_file_first_line("/d/sof/fw_profile/fw_name",
+				     fw_name, sizeof(fw_name));
 
-		char candidates[4][256];
+		char candidates[10][256];
 		snprintf(candidates[0], sizeof(candidates[0]),
 			 "/lib/firmware/%s/%s", fw_dir, fw_name);
 		snprintf(candidates[1], sizeof(candidates[1]),
-			 "/lib/firmware/intel/sof-ipc4/ptl/%s", fw_name);
+			 "/vendor/firmware/%s/%s", fw_dir, fw_name);
 		snprintf(candidates[2], sizeof(candidates[2]),
-			 "/lib/firmware/intel/sof-ipc4/arl/%s", fw_name);
+			 "/lib/firmware/intel/sof-ipc4/ptl/%s", fw_name);
 		snprintf(candidates[3], sizeof(candidates[3]),
+			 "/vendor/firmware/intel/sof-ipc4/ptl/%s", fw_name);
+		snprintf(candidates[4], sizeof(candidates[4]),
+			 "/lib/firmware/intel/sof-ipc4/wcl/%s", fw_name);
+		snprintf(candidates[5], sizeof(candidates[5]),
+			 "/vendor/firmware/intel/sof-ipc4/wcl/%s", fw_name);
+		snprintf(candidates[6], sizeof(candidates[6]),
+			 "/lib/firmware/intel/sof-ipc4/arl/%s", fw_name);
+		snprintf(candidates[7], sizeof(candidates[7]),
+			 "/vendor/firmware/intel/sof-ipc4/arl/%s", fw_name);
+		snprintf(candidates[8], sizeof(candidates[8]),
 			 "/lib/firmware/intel/sof-ipc4/tgl/%s", fw_name);
+		snprintf(candidates[9], sizeof(candidates[9]),
+			 "/vendor/firmware/intel/sof-ipc4/tgl/%s", fw_name);
 
 		FILE *fp = NULL;
-		for (int i = 0; i < 4 && !fp; i++)
+		for (int i = 0; i < 10 && !fp; i++)
 			fp = fopen(candidates[i], "rb");
 
 		if (fp) {
@@ -2551,6 +2580,11 @@ int main(int argc, char **argv)
 	printf("sof_remote_server listening on 0.0.0.0:%d (device %s)\n",
 	       g_port, g_cdev_path);
 	fflush(stdout);
+#ifdef __ANDROID__
+	__android_log_print(ANDROID_LOG_INFO, "sof_remote_server",
+			    "listening on 0.0.0.0:%d (device %s)",
+			    g_port, g_cdev_path);
+#endif
 
 	while (g_running) {
 		struct sockaddr_in cli_addr;
