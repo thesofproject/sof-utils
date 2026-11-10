@@ -22,6 +22,32 @@
 #include <sound/compress_offload.h>
 #ifdef HAVE_TINYCOMPRESS
 #include <tinycompress/tinycompress.h>
+
+static int compr_tstamp_uint(int (*fn)(struct compress *, unsigned int *, unsigned int *),
+			     struct compress *c, uint64_t *so, unsigned int *ro)
+{
+	unsigned int s = 0;
+	int rc = fn(c, &s, ro);
+	if (rc == 0)
+		*so = s;
+	return rc;
+}
+
+static int compr_tstamp_ulong(int (*fn)(struct compress *, unsigned long *, unsigned int *),
+			      struct compress *c, uint64_t *so, unsigned int *ro)
+{
+	unsigned long s = 0;
+	int rc = fn(c, &s, ro);
+	if (rc == 0)
+		*so = (uint64_t)s;
+	return rc;
+}
+
+#define compr_get_tstamp_compat(c, so, ro) \
+	_Generic((&compress_get_tstamp), \
+		int (*)(struct compress *, unsigned long *, unsigned int *): compr_tstamp_ulong, \
+		default: compr_tstamp_uint \
+	)(&compress_get_tstamp, (c), (so), (ro))
 #endif
 
 #include "audio_backends.h"
@@ -265,8 +291,9 @@ int compr_handle_ctl(const struct sof_net_compr_req *req,
 			}
 		}
 
-		unsigned int samples = 0, srate = 0;
-		if (compress_get_tstamp(compr, &samples, &srate) == 0) {
+		uint64_t samples = 0;
+		unsigned int srate = 0;
+		if (compr_get_tstamp_compat(compr, &samples, &srate) == 0) {
 			rsp.rendered_samples = samples;
 			rsp.sampling_rate = srate;
 		}
@@ -336,8 +363,9 @@ int compr_handle_ctl(const struct sof_net_compr_req *req,
 			got_bytes += (uint32_t)nr;
 		}
 
-		unsigned int samples = 0, srate = 0;
-		if (compress_get_tstamp(compr, &samples, &srate) == 0) {
+		uint64_t samples = 0;
+		unsigned int srate = 0;
+		if (compr_get_tstamp_compat(compr, &samples, &srate) == 0) {
 			rsp.rendered_samples = samples;
 			rsp.sampling_rate = srate;
 		}

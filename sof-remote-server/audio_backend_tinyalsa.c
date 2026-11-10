@@ -22,8 +22,17 @@
 #include "audio_backends.h"
 
 #ifdef HAVE_TINYALSA
+#if defined(__has_include) && __has_include(<tinyalsa/pcm.h>)
 #include <tinyalsa/pcm.h>
 #include <tinyalsa/mixer.h>
+#define HAVE_TINYALSA_V2 1
+#else
+#include <tinyalsa/asoundlib.h>
+#endif
+
+#ifndef PCM_NONBLOCK
+#define PCM_NONBLOCK 0
+#endif
 
 static enum pcm_format sof_to_tinyalsa_format(uint32_t fmt_id)
 {
@@ -32,10 +41,66 @@ static enum pcm_format sof_to_tinyalsa_format(uint32_t fmt_id)
 	case SOF_PCM_FMT_S24_LE:   return PCM_FORMAT_S24_LE;
 	case SOF_PCM_FMT_S24_3LE:  return PCM_FORMAT_S24_3LE;
 	case SOF_PCM_FMT_S32_LE:   return PCM_FORMAT_S32_LE;
+#ifdef HAVE_TINYALSA_V2
 	case SOF_PCM_FMT_FLOAT_LE: return PCM_FORMAT_FLOAT_LE;
+#endif
 	case SOF_PCM_FMT_S16_LE:
 	default:                   return PCM_FORMAT_S16_LE;
 	}
+}
+
+static int tiny_pcm_write_frames(struct pcm *pcm, const void *data,
+				 uint32_t frames, uint32_t bpf)
+{
+#ifdef HAVE_TINYALSA_V2
+	(void)bpf;
+	return pcm_writei(pcm, data, frames);
+#else
+	int rc = pcm_write(pcm, data, frames * bpf);
+	return (rc == 0) ? (int)frames : rc;
+#endif
+}
+
+static int tiny_pcm_read_frames(struct pcm *pcm, void *data,
+				uint32_t frames, uint32_t bpf)
+{
+#ifdef HAVE_TINYALSA_V2
+	(void)bpf;
+	return pcm_readi(pcm, data, frames);
+#else
+	int rc = pcm_read(pcm, data, frames * bpf);
+	return (rc == 0) ? (int)frames : rc;
+#endif
+}
+
+static int tiny_pcm_drain(struct pcm *pcm)
+{
+#ifdef HAVE_TINYALSA_V2
+	return pcm_drain(pcm);
+#else
+	return pcm_ioctl(pcm, SNDRV_PCM_IOCTL_DRAIN);
+#endif
+}
+
+static unsigned int tiny_mixer_ctl_get_id(struct mixer_ctl *ctl, unsigned int fallback_idx)
+{
+#ifdef HAVE_TINYALSA_V2
+	(void)fallback_idx;
+	return mixer_ctl_get_id(ctl);
+#else
+	(void)ctl;
+	return fallback_idx;
+#endif
+}
+
+static unsigned int tiny_mixer_ctl_get_device(struct mixer_ctl *ctl)
+{
+#ifdef HAVE_TINYALSA_V2
+	return mixer_ctl_get_device(ctl);
+#else
+	(void)ctl;
+	return 0;
+#endif
 }
 
 /* -------------------------------------------------------------------------
@@ -64,22 +129,24 @@ int tinyalsa_query_pcm_caps(uint32_t card_id, uint32_t dev_id, uint32_t directio
 		out->formats_mask |= SOF_FMTBIT_S8;
 	if (pcm_params_format_test(params, PCM_FORMAT_S16_LE))
 		out->formats_mask |= SOF_FMTBIT_S16_LE;
-	if (pcm_params_format_test(params, PCM_FORMAT_S16_BE))
-		out->formats_mask |= SOF_FMTBIT_S16_BE;
 	if (pcm_params_format_test(params, PCM_FORMAT_S24_LE))
 		out->formats_mask |= SOF_FMTBIT_S24_LE;
-	if (pcm_params_format_test(params, PCM_FORMAT_S24_BE))
-		out->formats_mask |= SOF_FMTBIT_S24_BE;
 	if (pcm_params_format_test(params, PCM_FORMAT_S24_3LE))
 		out->formats_mask |= SOF_FMTBIT_S24_3LE;
-	if (pcm_params_format_test(params, PCM_FORMAT_S24_3BE))
-		out->formats_mask |= SOF_FMTBIT_S24_3BE;
 	if (pcm_params_format_test(params, PCM_FORMAT_S32_LE))
 		out->formats_mask |= SOF_FMTBIT_S32_LE;
+#ifdef HAVE_TINYALSA_V2
+	if (pcm_params_format_test(params, PCM_FORMAT_S16_BE))
+		out->formats_mask |= SOF_FMTBIT_S16_BE;
+	if (pcm_params_format_test(params, PCM_FORMAT_S24_BE))
+		out->formats_mask |= SOF_FMTBIT_S24_BE;
+	if (pcm_params_format_test(params, PCM_FORMAT_S24_3BE))
+		out->formats_mask |= SOF_FMTBIT_S24_3BE;
 	if (pcm_params_format_test(params, PCM_FORMAT_S32_BE))
 		out->formats_mask |= SOF_FMTBIT_S32_BE;
 	if (pcm_params_format_test(params, PCM_FORMAT_FLOAT_LE))
 		out->formats_mask |= SOF_FMTBIT_FLOAT_LE;
+#endif
 
 	const struct pcm_mask *amask = pcm_params_get_mask(params, PCM_PARAM_ACCESS);
 	if (amask)
@@ -257,7 +324,7 @@ int tinyalsa_pcm_play_frames(uint32_t card_id, uint32_t dev_id, uint32_t fmt_id,
 					     cfg.channels, &phase, step);
 		}
 
-		int rc = pcm_writei(pcm, src_ptr, chunk);
+		int rc = tiny_pcm_write_frames(pcm, src_ptr, chunk, bpf);
 		if (rc == -EPIPE) {
 			xruns++;
 			pcm_prepare(pcm);
@@ -285,7 +352,7 @@ int tinyalsa_pcm_play_frames(uint32_t card_id, uint32_t dev_id, uint32_t fmt_id,
 	}
 
 	if (total_frames > 0 && err >= 0)
-		pcm_drain(pcm);
+		tiny_pcm_drain(pcm);
 	else
 		pcm_stop(pcm);
 
@@ -330,7 +397,7 @@ int tinyalsa_pcm_capture_frames(uint32_t card_id, uint32_t dev_id, uint32_t fmt_
 		uint32_t chunk = rem < psize ? rem : psize;
 		uint8_t *dst = (uint8_t *)out_buf + (size_t)got_frames * bpf;
 
-		int rc = pcm_readi(pcm, dst, chunk);
+		int rc = tiny_pcm_read_frames(pcm, dst, chunk, bpf);
 		if (rc == -EPIPE) {
 			xruns++;
 			pcm_prepare(pcm);
@@ -369,11 +436,11 @@ static int fill_tinyalsa_kctl_info(uint32_t card_id, struct mixer_ctl *ctl,
 	kinfo->pipeline_id = -1;
 
 	/* TinyALSA mixer_ctl_get_id() returns (kernel numid - 1) */
-	unsigned int cid = mixer_ctl_get_id(ctl);
+	unsigned int cid = tiny_mixer_ctl_get_id(ctl, idx);
 	kinfo->numid = (cid != UINT_MAX) ? (cid + 1U) : (idx + 1U);
 	kinfo->iface = 2; /* MIXER */
 	snprintf(kinfo->iface_str, sizeof(kinfo->iface_str), "MIXER");
-	kinfo->device = mixer_ctl_get_device(ctl);
+	kinfo->device = tiny_mixer_ctl_get_device(ctl);
 
 	const char *name = mixer_ctl_get_name(ctl);
 	if (name)
@@ -545,7 +612,7 @@ static struct mixer_ctl *find_tiny_ctl(struct mixer *mixer,
 					continue;
 				const char *nm = mixer_ctl_get_name(c);
 				if (nm && strcmp(nm, req->name) == 0 &&
-				    mixer_ctl_get_device(c) == req->device) {
+				    tiny_mixer_ctl_get_device(c) == req->device) {
 					matched = c;
 					matched_idx = i;
 					match_count++;
@@ -571,7 +638,7 @@ static struct mixer_ctl *find_tiny_ctl(struct mixer *mixer,
 			struct mixer_ctl *c = mixer_get_ctl(mixer, i);
 			if (!c)
 				continue;
-			unsigned int cid = mixer_ctl_get_id(c);
+			unsigned int cid = tiny_mixer_ctl_get_id(c, i);
 			unsigned int numid = (cid != UINT_MAX) ? (cid + 1U) : (i + 1U);
 			if (numid == target_numid) {
 				*idx_out = i;

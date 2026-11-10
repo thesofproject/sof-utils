@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_defaults {
+    name: "sof_remote_defaults",
+    vendor: true,
+    cflags: [
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",
+        "-DNO_ALSA",
+        "-DHAVE_TINYALSA",
+        "-DHAVE_TINYCOMPRESS",
+    ],
+}
+
+cc_binary {
+    name: "sof_remote_server",
+    defaults: ["sof_remote_defaults"],
+    srcs: [
+        "sof_remote_server.c",
+        "audio_backend_alsa.c",
+        "audio_backend_tinyalsa.c",
+        "audio_backend_compress.c",
+        "dapm_inspector.c",
+    ],
+    shared_libs: [
+        "libtinyalsa",
+        "libtinycompress",
+        "liblog",
+    ],
+    init_rc: ["sof_remote_server.rc"],
+}
+
+cc_binary {
+    name: "sof-remote",
+    defaults: ["sof_remote_defaults"],
+    srcs: [
+        "sof_remote_cli.c",
+    ],
+    shared_libs: [
+        "liblog",
+    ],
+}

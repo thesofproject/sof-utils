@@ -13,6 +13,7 @@ dist/
 *.a
 sof-remote-server/sof_remote_server
 sof-remote-server/sof-remote
+sof-remote-server/build-android-*/
 
 # Virtual environments
 .venv/

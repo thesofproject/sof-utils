@@ -120,6 +120,14 @@ static void detect_card_tplg_file(const char *card_driver, char *tplg_out, size_
 					 candidates[i] + strlen("/lib/firmware/"));
 				return;
 			}
+			char vpath[256];
+			snprintf(vpath, sizeof(vpath), "/vendor/firmware/%s",
+				 candidates[i] + strlen("/lib/firmware/"));
+			if (access(vpath, R_OK) == 0) {
+				snprintf(tplg_out, cap, "%s",
+					 candidates[i] + strlen("/lib/firmware/"));
+				return;
+			}
 		}
 	}
 }
@@ -132,12 +140,18 @@ static uint32_t parse_tplg_widget_kcontrols(const char *tplg_rel_path,
 		return 0;
 
 	char full_path[256];
-	if (tplg_rel_path[0] == '/')
+	int fd = -1;
+	if (tplg_rel_path[0] == '/') {
 		snprintf(full_path, sizeof(full_path), "%s", tplg_rel_path);
-	else
+		fd = open(full_path, O_RDONLY);
+	} else {
 		snprintf(full_path, sizeof(full_path), "/lib/firmware/%s", tplg_rel_path);
-
-	int fd = open(full_path, O_RDONLY);
+		fd = open(full_path, O_RDONLY);
+		if (fd < 0) {
+			snprintf(full_path, sizeof(full_path), "/vendor/firmware/%s", tplg_rel_path);
+			fd = open(full_path, O_RDONLY);
+		}
+	}
 	if (fd < 0)
 		return 0;
 
@@ -968,8 +982,18 @@ static int find_node_index_by_name(const struct sof_net_dapm_node *nodes,
 	return -1;
 }
 
+static const char *asoc_debugfs_root(void)
+{
+	if (access("/sys/kernel/debug/asoc", R_OK) == 0)
+		return "/sys/kernel/debug/asoc";
+	if (access("/d/asoc", R_OK) == 0)
+		return "/d/asoc";
+	return "/sys/kernel/debug/asoc";
+}
+
 static void resolve_asoc_card_dir(uint32_t card_id, char *card_dir_name, size_t cap)
 {
+	const char *asoc_root = asoc_debugfs_root();
 	char id_str[32] = {0}, drv_str[32] = {0}, name_str[64] = {0};
 	FILE *fp = fopen("/proc/asound/cards", "r");
 
@@ -998,14 +1022,14 @@ static void resolve_asoc_card_dir(uint32_t card_id, char *card_dir_name, size_t 
 		if (!cands[i][0])
 			continue;
 		char p[192];
-		snprintf(p, sizeof(p), "/sys/kernel/debug/asoc/%s", cands[i]);
+		snprintf(p, sizeof(p), "%s/%s", asoc_root, cands[i]);
 		if (access(p, R_OK) == 0) {
 			snprintf(card_dir_name, cap, "%s", cands[i]);
 			return;
 		}
 	}
 
-	DIR *asoc_d = opendir("/sys/kernel/debug/asoc");
+	DIR *asoc_d = opendir(asoc_root);
 	if (asoc_d) {
 		struct dirent *de;
 		uint32_t idx = 0;
@@ -1046,7 +1070,7 @@ int dapm_build_graph_payload(uint32_t card_id, uint8_t **out_buf_ptr,
 	resolve_asoc_card_dir(card_id, card_dir_name, sizeof(card_dir_name));
 
 	char card_base[128];
-	snprintf(card_base, sizeof(card_base), "/sys/kernel/debug/asoc/%s", card_dir_name);
+	snprintf(card_base, sizeof(card_base), "%s/%s", asoc_debugfs_root(), card_dir_name);
 
 	struct sof_net_dapm_comp_status comps[16];
 	struct sof_net_dapm_node *nodes = calloc(256, sizeof(*nodes));

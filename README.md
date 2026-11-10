@@ -94,15 +94,24 @@ See [`sof-builder/README.md`](sof-builder/README.md) for full documentation, env
 
 ---
 
-## Quick Start: `sof-top`
+## Quick Start: `sof-top` & `sof-remote-server` (Linux & Android)
 
 ```bash
-# Build sof_remote_server for DUTs:
+# Build sof_remote_server and sof-remote for Linux DUTs:
 make -C sof-remote-server
+
+# Cross-compile sof_remote_server and sof-remote for Android (NDK or AOSP Bionic + TinyALSA):
+make android                     # Default: x86_64-linux-android34
+make android ANDROID_ABI=arm64-v8a
+
+# Push to an Android DUT over ADB (/data/local/tmp/) and forward TCP port 9998:
+make android-push
 
 # Launch sof-top (Moving Core Graph + Moving SRAM/DRAM Memory Graph + DSP Task List):
 ./sof-top/sof-top --host aphid --wake
 ```
+
+For in-tree AOSP builds, [`sof-remote-server/Android.bp`](sof-remote-server/Android.bp) and [`sof-remote-server/sof_remote_server.rc`](sof-remote-server/sof_remote_server.rc) provide native Soong `cc_binary` targets (`m sof_remote_server sof-remote`).
 
 ---
 
