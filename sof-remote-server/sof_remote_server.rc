@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
+# Android init service for SOF Remote Telemetry & Debug Server
+
+service vendor.sof_remote_server /vendor/bin/sof_remote_server -p 9998
+    class late_start
+    user root
+    group root audio system
+    disabled
+
+on property:sys.boot_completed=1 && property:ro.debuggable=1
+    start vendor.sof_remote_server
