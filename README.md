@@ -13,6 +13,7 @@ Developer utilities, visual tools, and host applications for the [Sound Open Fir
 | **[`sof-builder`](sof-builder/)** | [`sof-builder/`](sof-builder/) | GTK4 Topology2 Visual Graph Editor, IPC4 `.tplg` Compiler & Real-Time `sof-testbench4` Simulation / Telemetry Studio |
 | **[`sof-testbench`](sof-testbench/)** | [`sof-testbench/`](sof-testbench/) | Multi-Core LL/DP `sof-testbench4` Simulator, `sof-tb-ctl` TCP Control CLI, Host Platform Runtime (`platform/library`), and 70-Test Suite |
 | **[`sof-tplg-parser`](sof-tplg-parser/)** | [`sof-tplg-parser/`](sof-tplg-parser/) | ALSA Topology (`.tplg`) IPC3/IPC4 Parser Library (`libsof_tplg_parser.a`) |
+| **[`sof-teensy`](sof-teensy/)** | [`sof-teensy/`](sof-teensy/) | PJRC Teensy 4.1 HalfKay Flashing, Hardware Loopback Verification (S/PDIF & SAI1 I2S), and Diagnostic Utilities |
 
 ---
 

@@ -105,6 +105,7 @@ install: build
 	$(MAKE) -C sof-remote-server DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" WORK_DIR="$(WORK_DIR)" install
 	$(MAKE) -C sof-builder DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" install
 	$(MAKE) -C sof-top DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" install
+	$(MAKE) -C sof-teensy DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" install
 	$(INSTALL) -d "$(DESTDIR)$(DOCDIR)"
 	$(INSTALL) -m 0644 README.md LICENSE "$(DESTDIR)$(DOCDIR)/"
 	@if [ -f "$(TB_BUILD_DIR)/sof-testbench4" ]; then \
@@ -130,6 +131,7 @@ uninstall:
 	$(MAKE) -C sof-remote-server DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" uninstall
 	$(MAKE) -C sof-builder DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" uninstall
 	$(MAKE) -C sof-top DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" uninstall
+	$(MAKE) -C sof-teensy DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" uninstall
 	rm -f "$(DESTDIR)$(BINDIR)/sof-testbench4" \
 	      "$(DESTDIR)$(BINDIR)/sof-testbench3" \
 	      "$(DESTDIR)$(BINDIR)/sof-tb-ctl" \
@@ -140,6 +142,7 @@ uninstall:
 check:
 	$(MAKE) -C sof-builder PYTHON="$(PYTHON)" check
 	$(MAKE) -C sof-top PYTHON="$(PYTHON)" check
+	$(MAKE) -C sof-teensy PYTHON="$(PYTHON)" check
 
 test: check
 
