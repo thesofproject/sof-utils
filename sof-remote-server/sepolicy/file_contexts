@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
+# Reference SELinux file contexts for sof_remote_server
+/vendor/bin/sof_remote_server    u:object_r:sof_remote_server_exec:s0

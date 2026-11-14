@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
+# Reference SELinux policy for SOF Remote Telemetry & Debug Server (debuggable builds only)
+
+type sof_remote_server, domain;
+type sof_remote_server_exec, exec_type, vendor_file_type, file_type;
+
+userdebug_or_eng(`
+    init_daemon_domain(sof_remote_server)
+
+    # Allow adb/shell on userdebug/eng builds to opt-in via persist.vendor.sof.remote_server.enable
+    set_prop(shell, vendor_sof_remote_server_prop)
+
+    # TinyALSA / TinyCompress audio devices (/dev/snd/*)
+    allow sof_remote_server audio_device:dir r_dir_perms;
+    allow sof_remote_server audio_device:chr_file rw_file_perms;
+
+    # Telemetry sysfs and debugfs access (/sys/kernel/debug/sof, etc.)
+    allow sof_remote_server sysfs:dir r_dir_perms;
+    allow sof_remote_server sysfs:file r_file_perms;
+    allow sof_remote_server debugfs:dir r_dir_perms;
+    allow sof_remote_server debugfs:file rw_file_perms;
+
+    # Loopback TCP daemon socket (127.0.0.1:9998 for adb forward)
+    allow sof_remote_server self:tcp_socket create_stream_socket_perms;
+    allow sof_remote_server node:tcp_socket node_bind;
+    allow sof_remote_server port:tcp_socket name_bind;
+')

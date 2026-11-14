@@ -34,18 +34,23 @@
 #define PCM_NONBLOCK 0
 #endif
 
-static enum pcm_format sof_to_tinyalsa_format(uint32_t fmt_id)
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <sound/asound.h>
+
+static int sof_to_tinyalsa_format(uint32_t fmt_id, enum pcm_format *out_fmt)
 {
 	switch (fmt_id) {
-	case SOF_PCM_FMT_S8:       return PCM_FORMAT_S8;
-	case SOF_PCM_FMT_S24_LE:   return PCM_FORMAT_S24_LE;
-	case SOF_PCM_FMT_S24_3LE:  return PCM_FORMAT_S24_3LE;
-	case SOF_PCM_FMT_S32_LE:   return PCM_FORMAT_S32_LE;
+	case SOF_PCM_FMT_S16_LE:   *out_fmt = PCM_FORMAT_S16_LE; return 0;
+	case SOF_PCM_FMT_S8:       *out_fmt = PCM_FORMAT_S8; return 0;
+	case SOF_PCM_FMT_S24_LE:   *out_fmt = PCM_FORMAT_S24_LE; return 0;
+	case SOF_PCM_FMT_S24_3LE:  *out_fmt = PCM_FORMAT_S24_3LE; return 0;
+	case SOF_PCM_FMT_S32_LE:   *out_fmt = PCM_FORMAT_S32_LE; return 0;
 #ifdef HAVE_TINYALSA_V2
-	case SOF_PCM_FMT_FLOAT_LE: return PCM_FORMAT_FLOAT_LE;
+	case SOF_PCM_FMT_FLOAT_LE: *out_fmt = PCM_FORMAT_FLOAT_LE; return 0;
 #endif
-	case SOF_PCM_FMT_S16_LE:
-	default:                   return PCM_FORMAT_S16_LE;
+	default:                   return -ENOTSUP;
 	}
 }
 
@@ -82,14 +87,103 @@ static int tiny_pcm_drain(struct pcm *pcm)
 #endif
 }
 
-static unsigned int tiny_mixer_ctl_get_id(struct mixer_ctl *ctl, unsigned int fallback_idx)
+struct tiny_elem_id_table {
+	struct snd_ctl_elem_id *ids;
+	unsigned int count;
+};
+
+static void tiny_elem_id_table_free(struct tiny_elem_id_table *tbl)
+{
+	free(tbl->ids);
+	tbl->ids = NULL;
+	tbl->count = 0;
+}
+
+/*
+ * Query exact kernel struct snd_ctl_elem_id array (preserving non-contiguous
+ * numid gaps, iface, device, subdevice, and index). TinyALSA's mixer_grp_open
+ * stores controls in the exact order returned by SNDRV_CTL_IOCTL_ELEM_LIST.
+ */
+static int tiny_elem_id_table_load(uint32_t card_id, struct tiny_elem_id_table *tbl)
+{
+	tbl->ids = NULL;
+	tbl->count = 0;
+
+	char path[64];
+	snprintf(path, sizeof(path), "/dev/snd/controlC%u", card_id);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+
+	struct snd_ctl_elem_list list;
+	memset(&list, 0, sizeof(list));
+	if (ioctl(fd, SNDRV_CTL_IOCTL_ELEM_LIST, &list) < 0) {
+		int err = -errno;
+		close(fd);
+		return err;
+	}
+
+	if (list.count == 0) {
+		close(fd);
+		return 0;
+	}
+
+	struct snd_ctl_elem_id *ids = calloc(list.count, sizeof(*ids));
+	if (!ids) {
+		close(fd);
+		return -ENOMEM;
+	}
+
+	list.offset = 0;
+	list.space = list.count;
+	list.pids = ids;
+	if (ioctl(fd, SNDRV_CTL_IOCTL_ELEM_LIST, &list) < 0) {
+		int err = -errno;
+		free(ids);
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	tbl->ids = ids;
+	tbl->count = list.count;
+	return 0;
+}
+
+static void tiny_iface_to_str(uint32_t iface, char *buf, size_t cap)
+{
+	switch (iface) {
+	case 0: snprintf(buf, cap, "CARD"); break;
+	case 1: snprintf(buf, cap, "HWDEP"); break;
+	case 2: snprintf(buf, cap, "MIXER"); break;
+	case 3: snprintf(buf, cap, "PCM"); break;
+	case 4: snprintf(buf, cap, "RAWMIDI"); break;
+	case 5: snprintf(buf, cap, "TIMER"); break;
+	case 6: snprintf(buf, cap, "SEQUENCER"); break;
+	default: snprintf(buf, cap, "%u", iface); break;
+	}
+}
+
+static void tiny_apply_elem_id(struct sof_net_kctl_info *kinfo,
+			       const struct snd_ctl_elem_id *eid)
+{
+	kinfo->numid = eid->numid;
+	kinfo->iface = (uint32_t)eid->iface;
+	tiny_iface_to_str(kinfo->iface, kinfo->iface_str, sizeof(kinfo->iface_str));
+	kinfo->device = eid->device;
+	kinfo->subdevice = eid->subdevice;
+	kinfo->index = eid->index;
+}
+
+static _Thread_local const struct tiny_elem_id_table *g_tls_eid_tbl = NULL;
+
+static unsigned int tiny_mixer_ctl_get_id_v2(struct mixer_ctl *ctl)
 {
 #ifdef HAVE_TINYALSA_V2
-	(void)fallback_idx;
 	return mixer_ctl_get_id(ctl);
 #else
 	(void)ctl;
-	return fallback_idx;
+	return UINT_MAX;
 #endif
 }
 
@@ -281,13 +375,18 @@ int tinyalsa_pcm_play_frames(uint32_t card_id, uint32_t dev_id, uint32_t fmt_id,
 			     _Atomic uint32_t *peak_out,
 			     uint32_t *xruns_out)
 {
+	enum pcm_format fmt;
+	int fmt_rc = sof_to_tinyalsa_format(fmt_id, &fmt);
+	if (fmt_rc < 0)
+		return fmt_rc;
+
 	struct pcm_config cfg;
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.channels = channels ? channels : 2;
 	cfg.rate = rate ? rate : 48000;
 	cfg.period_size = period_size ? period_size : 1024;
 	cfg.period_count = period_count ? period_count : 4;
-	cfg.format = sof_to_tinyalsa_format(fmt_id);
+	cfg.format = fmt;
 
 	struct pcm *pcm = pcm_open(card_id, dev_id, PCM_OUT, &cfg);
 	if (!pcm || !pcm_is_ready(pcm)) {
@@ -371,13 +470,18 @@ int tinyalsa_pcm_capture_frames(uint32_t card_id, uint32_t dev_id, uint32_t fmt_
 				uint32_t *rms_out, uint32_t *peak_out,
 				uint32_t *xruns_out)
 {
+	enum pcm_format fmt;
+	int fmt_rc = sof_to_tinyalsa_format(fmt_id, &fmt);
+	if (fmt_rc < 0)
+		return fmt_rc;
+
 	struct pcm_config cfg;
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.channels = channels ? channels : 2;
 	cfg.rate = rate ? rate : 48000;
 	cfg.period_size = period_size ? period_size : 1024;
 	cfg.period_count = period_count ? period_count : 4;
-	cfg.format = sof_to_tinyalsa_format(fmt_id);
+	cfg.format = fmt;
 
 	struct pcm *pcm = pcm_open(card_id, dev_id, PCM_IN, &cfg);
 	if (!pcm || !pcm_is_ready(pcm)) {
@@ -435,12 +539,27 @@ static int fill_tinyalsa_kctl_info(uint32_t card_id, struct mixer_ctl *ctl,
 	kinfo->target_edge_id = -1;
 	kinfo->pipeline_id = -1;
 
-	/* TinyALSA mixer_ctl_get_id() returns (kernel numid - 1) */
-	unsigned int cid = tiny_mixer_ctl_get_id(ctl, idx);
-	kinfo->numid = (cid != UINT_MAX) ? (cid + 1U) : (idx + 1U);
-	kinfo->iface = 2; /* MIXER */
-	snprintf(kinfo->iface_str, sizeof(kinfo->iface_str), "MIXER");
-	kinfo->device = tiny_mixer_ctl_get_device(ctl);
+	if (g_tls_eid_tbl && idx < g_tls_eid_tbl->count) {
+		tiny_apply_elem_id(kinfo, &g_tls_eid_tbl->ids[idx]);
+	} else {
+		struct tiny_elem_id_table local_tbl;
+		if (tiny_elem_id_table_load(card_id, &local_tbl) == 0 &&
+		    idx < local_tbl.count) {
+			tiny_apply_elem_id(kinfo, &local_tbl.ids[idx]);
+		} else {
+			/*
+			 * TinyALSA v2 mixer_ctl_get_id() returns (kernel numid - 1).
+			 * Do not fabricate (idx + 1) when neither SNDRV_CTL_IOCTL_ELEM_LIST
+			 * nor TinyALSA v2 IDs are available (gaps in kernel numids).
+			 */
+			unsigned int cid = tiny_mixer_ctl_get_id_v2(ctl);
+			kinfo->numid = (cid != UINT_MAX) ? (cid + 1U) : 0U;
+			kinfo->iface = 2; /* MIXER */
+			snprintf(kinfo->iface_str, sizeof(kinfo->iface_str), "MIXER");
+			kinfo->device = tiny_mixer_ctl_get_device(ctl);
+		}
+		tiny_elem_id_table_free(&local_tbl);
+	}
 
 	const char *name = mixer_ctl_get_name(ctl);
 	if (name)
@@ -552,11 +671,21 @@ int tinyalsa_kctl_list(uint32_t card_id, struct sof_net_kctl_info *out_arr,
 	if (total > max_items)
 		total = max_items;
 
+	struct tiny_elem_id_table id_tbl;
+	int id_rc = tiny_elem_id_table_load(card_id, &id_tbl);
+	g_tls_eid_tbl = (id_rc == 0) ? &id_tbl : NULL;
+
 	for (unsigned int i = 0; i < total; i++) {
 		struct mixer_ctl *ctl = mixer_get_ctl(mixer, i);
-		if (ctl)
+		if (ctl) {
 			(void)fill_tinyalsa_kctl_info(card_id, ctl, i, &out_arr[i], NULL, NULL);
+			if (id_rc == 0 && i < id_tbl.count)
+				tiny_apply_elem_id(&out_arr[i], &id_tbl.ids[i]);
+		}
 	}
+
+	g_tls_eid_tbl = NULL;
+	tiny_elem_id_table_free(&id_tbl);
 
 	*count_out = total;
 	mixer_close(mixer);
@@ -634,18 +763,51 @@ static struct mixer_ctl *find_tiny_ctl(struct mixer *mixer,
 	}
 
 	if (target_numid > 0) {
-		for (unsigned int i = 0; i < total; i++) {
-			struct mixer_ctl *c = mixer_get_ctl(mixer, i);
-			if (!c)
-				continue;
-			unsigned int cid = tiny_mixer_ctl_get_id(c, i);
-			unsigned int numid = (cid != UINT_MAX) ? (cid + 1U) : (i + 1U);
-			if (numid == target_numid) {
-				*idx_out = i;
-				if (err_out)
-					*err_out = 0;
-				return c;
+		struct tiny_elem_id_table id_tbl;
+		int id_rc = tiny_elem_id_table_load(req->card_id, &id_tbl);
+		if (id_rc == 0) {
+			for (unsigned int i = 0; i < total && i < id_tbl.count; i++) {
+				if (id_tbl.ids[i].numid == target_numid) {
+					struct mixer_ctl *c = mixer_get_ctl(mixer, i);
+					tiny_elem_id_table_free(&id_tbl);
+					if (c) {
+						*idx_out = i;
+						if (err_out)
+							*err_out = 0;
+						return c;
+					}
+					if (err_out)
+						*err_out = -ENOENT;
+					return NULL;
+				}
 			}
+			tiny_elem_id_table_free(&id_tbl);
+			if (!req->name[0]) {
+				if (err_out)
+					*err_out = -ENOENT;
+				return NULL;
+			}
+		} else {
+#ifdef HAVE_TINYALSA_V2
+			for (unsigned int i = 0; i < total; i++) {
+				struct mixer_ctl *c = mixer_get_ctl(mixer, i);
+				if (!c)
+					continue;
+				unsigned int cid = tiny_mixer_ctl_get_id_v2(c);
+				if (cid != UINT_MAX && (cid + 1U) == target_numid) {
+					*idx_out = i;
+					if (err_out)
+						*err_out = 0;
+					return c;
+				}
+			}
+#else
+			if (!req->name[0]) {
+				if (err_out)
+					*err_out = id_rc;
+				return NULL;
+			}
+#endif
 		}
 	}
 

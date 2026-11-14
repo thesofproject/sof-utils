@@ -1,0 +1,2 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
+persist.vendor.sof.remote_server.enable    u:object_r:vendor_sof_remote_server_prop:s0
