@@ -60,11 +60,20 @@ ADB              ?= adb
 AOSP_DIR         ?= $(firstword $(wildcard $(WORK_DIR)/work-extra/AOSP/wcl-desktop $(WORK_DIR)/AOSP))
 
 ifeq ($(ANDROID_ABI),arm64-v8a)
-ANDROID_TRIPLE   := aarch64-linux-android
+ANDROID_TRIPLE     := aarch64-linux-android
+ANDROID_SOONG_ARCH := arm64
 else ifeq ($(ANDROID_ABI),aarch64)
-ANDROID_TRIPLE   := aarch64-linux-android
+ANDROID_TRIPLE     := aarch64-linux-android
+ANDROID_SOONG_ARCH := arm64
+else ifeq ($(ANDROID_ABI),armeabi-v7a)
+ANDROID_TRIPLE     := armv7a-linux-androideabi
+ANDROID_SOONG_ARCH := arm
+else ifeq ($(ANDROID_ABI),x86)
+ANDROID_TRIPLE     := i686-linux-android
+ANDROID_SOONG_ARCH := x86
 else
-ANDROID_TRIPLE   := x86_64-linux-android
+ANDROID_TRIPLE     := x86_64-linux-android
+ANDROID_SOONG_ARCH := x86_64
 endif
 
 ifneq ($(ANDROID_NDK_HOME),)
@@ -73,8 +82,8 @@ ANDROID_SYSROOT  ?= $(firstword $(wildcard $(ANDROID_NDK_HOME)/toolchains/llvm/p
 else ifneq ($(AOSP_DIR),)
 ANDROID_CLANG    ?= $(lastword $(sort $(wildcard $(AOSP_DIR)/prebuilts/clang/host/linux-x86/clang-r*/bin/clang)))
 ANDROID_SYSROOT  ?= $(AOSP_DIR)/out/soong/ndk/sysroot
-ANDROID_CRTBEGIN ?= $(dir $(firstword $(wildcard $(AOSP_DIR)/out/soong/.intermediates/bionic/libc/crtbegin_dynamic/android_$(ANDROID_ABI)*/crtbegin_dynamic.o)))
-ANDROID_CRTEND   ?= $(dir $(firstword $(wildcard $(AOSP_DIR)/out/soong/.intermediates/bionic/libc/crtend_android/android_$(ANDROID_ABI)*/crtend_android.o)))
+ANDROID_CRTBEGIN ?= $(dir $(firstword $(wildcard $(AOSP_DIR)/out/soong/.intermediates/bionic/libc/crtbegin_dynamic/android_$(ANDROID_SOONG_ARCH)*/crtbegin_dynamic.o)))
+ANDROID_CRTEND   ?= $(dir $(firstword $(wildcard $(AOSP_DIR)/out/soong/.intermediates/bionic/libc/crtend_android/android_$(ANDROID_SOONG_ARCH)*/crtend_android.o)))
 endif
 
 ANDROID_TINYALSA_DIR ?= $(firstword $(wildcard $(AOSP_DIR)/external/tinyalsa $(WORK_DIR)/tinyalsa))

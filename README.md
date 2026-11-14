@@ -96,22 +96,41 @@ See [`sof-builder/README.md`](sof-builder/README.md) for full documentation, env
 
 ## Quick Start: `sof-top` & `sof-remote-server` (Linux & Android)
 
+### Linux DUT Build
 ```bash
 # Build sof_remote_server and sof-remote for Linux DUTs:
-make -C sof-remote-server
-
-# Cross-compile sof_remote_server and sof-remote for Android (NDK or AOSP Bionic + TinyALSA):
-make android                     # Default: x86_64-linux-android34
-make android ANDROID_ABI=arm64-v8a
-
-# Push to an Android DUT over ADB (/data/local/tmp/) and forward TCP port 9998:
-make android-push
+make remote-server
+# or: make -C sof-remote-server
 
 # Launch sof-top (Moving Core Graph + Moving SRAM/DRAM Memory Graph + DSP Task List):
-./sof-top/sof-top --host aphid --wake
+./sof-top/sof-top --host <dut-ip> --wake
 ```
 
-For in-tree AOSP builds, [`sof-remote-server/Android.bp`](sof-remote-server/Android.bp) and [`sof-remote-server/sof_remote_server.rc`](sof-remote-server/sof_remote_server.rc) provide native Soong `cc_binary` targets (`m sof_remote_server sof-remote`).
+### Android DUT Build (NDK, AOSP `make android`, CMake, or Soong)
+
+`sof-remote-server` cross-compiles cleanly against Bionic (`NO_ALSA` + TinyALSA + TinyCompress + `liblog`):
+
+```bash
+# 1. Cross-compile with Android NDK (or set AOSP_DIR=/path/to/aosp):
+make android ANDROID_NDK_HOME=/path/to/android-ndk ANDROID_ABI=arm64-v8a ANDROID_API=34
+make android ANDROID_ABI=x86_64                     # Default ABI
+
+# 2. Push binaries to /data/local/tmp/ and forward TCP port 9998 over ADB:
+make android-push ANDROID_ABI=arm64-v8a
+adb shell /data/local/tmp/sof_remote_server -p 9998
+
+# 3. Connect host tools (sof-top / sof-remote) over the ADB-forwarded loopback port:
+./sof-top/sof-top --host 127.0.0.1 --port 9998
+```
+
+For security, Android builds bind `127.0.0.1` by default (use `-b <addr>` to override) and disable `host:` shell `popen()` execution unless `-E` is explicitly passed.
+
+For in-tree AOSP integration:
+- **Soong**: [`sof-remote-server/Android.bp`](sof-remote-server/Android.bp) builds `sof_remote_server` and `sof-remote` (`m sof_remote_server sof-remote`).
+- **Init service**: [`sof-remote-server/sof_remote_server.rc`](sof-remote-server/sof_remote_server.rc) is opt-in on debuggable builds (`adb shell setprop persist.vendor.sof.remote_server.enable 1`).
+- **SELinux**: Reference vendor policy files live in [`sof-remote-server/sepolicy/`](sof-remote-server/sepolicy/) (`BOARD_VENDOR_SEPOLICY_DIRS`).
+
+See [`sof-remote-server/README.md`](sof-remote-server/README.md) for CMake Android toolchain flags and full setup details.
 
 ---
 

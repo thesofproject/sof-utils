@@ -45,6 +45,13 @@
 static volatile sig_atomic_t g_running = 1;
 static const char *g_cdev_path = "/dev/sof-dsp0";
 static int g_port = SOF_NET_DEFAULT_PORT;
+#ifdef __ANDROID__
+static const char *g_bind_addr = "127.0.0.1";
+static bool g_allow_host_shell = false;
+#else
+static const char *g_bind_addr = "0.0.0.0";
+static bool g_allow_host_shell = true;
+#endif
 
 /* Global ALSA / TinyALSA Tone Generator State */
 static pthread_mutex_t g_pcm_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1840,6 +1847,11 @@ static int exec_dsp_shell(int cdev_fd, const char *cmd, uint32_t timeout_ms,
 			  char *out_buf, size_t out_cap)
 {
 	if (strncmp(cmd, "host:", 5) == 0) {
+		if (!g_allow_host_shell) {
+			snprintf(out_buf, out_cap,
+				 "host: shell execution is disabled (start with -E to enable)");
+			return -EACCES;
+		}
 		FILE *fp = popen(cmd + 5, "r");
 		if (!fp)
 			return -errno;
@@ -2522,8 +2534,11 @@ int main(int argc, char **argv)
 	int opt;
 	bool daemonize = false;
 
-	while ((opt = getopt(argc, argv, "d:p:Dh")) != -1) {
+	while ((opt = getopt(argc, argv, "b:d:p:DESh")) != -1) {
 		switch (opt) {
+		case 'b':
+			g_bind_addr = optarg;
+			break;
 		case 'd':
 			g_cdev_path = optarg;
 			break;
@@ -2533,12 +2548,24 @@ int main(int argc, char **argv)
 		case 'D':
 			daemonize = true;
 			break;
+		case 'E':
+			g_allow_host_shell = true;
+			break;
+		case 'S':
+			g_allow_host_shell = false;
+			break;
 		default:
 			fprintf(stderr,
-				"Usage: %s [-d /dev/sof-dsp0] [-p 9998] [-D]\n",
-				argv[0]);
+				"Usage: %s [-b %s] [-d /dev/sof-dsp0] [-p 9998] [-D] [-E|-S]\n",
+				argv[0], g_bind_addr);
 			return 1;
 		}
+	}
+
+	struct in_addr bind_ip;
+	if (inet_pton(AF_INET, g_bind_addr, &bind_ip) != 1) {
+		fprintf(stderr, "Invalid IPv4 bind address: %s\n", g_bind_addr);
+		return 1;
 	}
 
 	signal(SIGINT, sig_handler);
@@ -2557,7 +2584,7 @@ int main(int argc, char **argv)
 	struct sockaddr_in bind_addr;
 	memset(&bind_addr, 0, sizeof(bind_addr));
 	bind_addr.sin_family = AF_INET;
-	bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	bind_addr.sin_addr = bind_ip;
 	bind_addr.sin_port = htons((uint16_t)g_port);
 
 	if (bind(srv_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
@@ -2577,13 +2604,15 @@ int main(int argc, char **argv)
 			perror("daemon");
 	}
 
-	printf("sof_remote_server listening on 0.0.0.0:%d (device %s)\n",
-	       g_port, g_cdev_path);
+	printf("sof_remote_server listening on %s:%d (device %s, host_shell=%s)\n",
+	       g_bind_addr, g_port, g_cdev_path,
+	       g_allow_host_shell ? "enabled" : "disabled");
 	fflush(stdout);
 #ifdef __ANDROID__
 	__android_log_print(ANDROID_LOG_INFO, "sof_remote_server",
-			    "listening on 0.0.0.0:%d (device %s)",
-			    g_port, g_cdev_path);
+			    "listening on %s:%d (device %s, host_shell=%s)",
+			    g_bind_addr, g_port, g_cdev_path,
+			    g_allow_host_shell ? "enabled" : "disabled");
 #endif
 
 	while (g_running) {

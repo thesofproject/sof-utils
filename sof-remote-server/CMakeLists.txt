@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause)
 cmake_minimum_required(VERSION 3.19)
+project(sof_remote_server LANGUAGES C)
 
 add_executable(sof-remote sof_remote_cli.c)
 target_include_directories(sof-remote PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(sof-remote PRIVATE pthread m)
+if(ANDROID)
+	target_link_libraries(sof-remote PRIVATE m)
+else()
+	target_link_libraries(sof-remote PRIVATE pthread m)
+endif()
 install(TARGETS sof-remote DESTINATION bin)
 
 find_library(ASOUND_LIB NAMES asound libasound.so.2)
