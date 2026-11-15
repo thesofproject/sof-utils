@@ -1,0 +1,837 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright(c) 2026 Intel Corporation. All rights reserved.
+"""
+sof-top-cli — Command-line SOF DSP Telemetry Snapshot & Stream Tool
+
+Designed for both human engineers and automated agents to extract full SOF DSP
+telemetry (cores, memory SRAM/DRAM/heaps, unified tasks, IPC4/PMW2 components,
+IO perf, pipelines, gateways, Zephyr RTOS threads, VMH, fast_get, vregion,
+mailbox windows/slots, loaded modules, plus optional ALSA/DAPM graph & probes)
+as single snapshots or real-time streams with fine-grained element selection.
+"""
+
+import argparse
+from dataclasses import asdict
+from datetime import datetime, timezone
+import json
+import os
+import signal
+import sys
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from backend import (
+    SOF_NET_DEFAULT_PORT,
+    SOF_PM_OP_BOOT_DSP,
+    SOF_PM_OP_RELEASE_HOLD,
+    SOF_PM_OP_WAKE_HOLD,
+    RemoteTcpBackend,
+    TelemetrySnapshot,
+    build_backend_for_target,
+    compute_sram_segment_metrics,
+    probe_local_sof_device,
+)
+
+
+ALL_TELEM_SECTIONS: Tuple[str, ...] = (
+    "summary",
+    "regs",
+    "cores",
+    "memory",
+    "heaps",
+    "tasks",
+    "components",
+    "io_perf",
+    "pipelines",
+    "gateways",
+    "threads",
+    "vmh",
+    "fast_get",
+    "vregion",
+    "windows",
+    "debug_slots",
+    "modules",
+)
+
+RPC_EXTRA_SECTIONS: Tuple[str, ...] = ("audio", "probes")
+
+ELEMENT_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "meta": ("summary",),
+    "sram": (
+        "memory.hpsram",
+        "memory.lpsram",
+        "memory.sram_used_kb",
+        "memory.sram_powered_kb",
+        "memory.sram_total_kb",
+    ),
+    "hpsram": ("memory.hpsram",),
+    "lpsram": ("memory.lpsram",),
+    "dram": ("memory.dram_used_kb", "memory.dram_hwm_kb", "memory.dram_total_kb"),
+    "heap": (
+        "memory.heap_allocated_bytes",
+        "memory.heap_free_bytes",
+        "memory.heap_max_bytes",
+        "memory.heap_total_bytes",
+        "heaps",
+    ),
+    "platform": ("summary.platform",),
+    "fw": ("summary.fw_filename", "summary.fw_version", "summary.fw_state", "summary.fw_state_name"),
+    "fw_state": ("summary.fw_state", "summary.fw_state_name"),
+    "fw_version": ("summary.fw_version",),
+    "clock": ("summary.dsp_clock_hz",),
+    "power": ("summary.pm_runtime_active", "summary.dsp_power_state"),
+}
+
+ELEMENT_CATALOG: Dict[str, str] = {
+    "summary": "Platform, FW file/version, fw_state, PM status, clock Hz, cores mask, TEL2/PMW2 flags, xruns",
+    "regs": "Window 0 FW registers (fw_status, lec, fps, lnec, ltr) & packet sizes",
+    "cores": "Per-core CPU load %, peak %, avg/peak/budget KCPS, ticks/s, overruns, deadline misses",
+    "memory": "HPSRAM/LPSRAM (used/powered/total KB, banks, pages), DRAM L3/IMR, combined heap totals",
+    "heaps": "Individual DSP heap pools (total, allocated, free, HWM, alloc failures)",
+    "tasks": "Unified DSP task list (schedulers, modules, threads, gateways, pipelines)",
+    "components": "IPC4 / PMW2 per-module cycles, KCPS, iterations, heap HWM, CPC violations, xruns",
+    "io_perf": "IO gateway perf utilization items",
+    "pipelines": "Pipeline IDs, cores, priorities, states, periods, schedulers, xrun stats",
+    "gateways": "DMA/DAI gateway slots, directions, channels, buffer sizes & xruns",
+    "threads": "Zephyr RTOS threads (prio, state, CPU %, stack %, exec kcycles)",
+    "vmh": "Virtual Memory Heap region size, OOM count, block bundle statistics",
+    "fast_get": "fast_get SRAM cache active entries, peaks, calls, failures",
+    "vregion": "Virtual region allocator pages, element counts & vregion list",
+    "windows": "DSP telemetry / mailbox BAR windows",
+    "debug_slots": "Window 2 debug slots (resource IDs, offsets, sizes)",
+    "modules": "Loaded FW module ID -> name mapping",
+    "audio": "(TCP only) ALSA cards, PCM capabilities, DAPM widgets/edges & kcontrols",
+    "probes": "(TCP only) Available and active SOF probe points",
+}
+
+
+def _sram_to_dict(seg, bank_kb: float) -> Dict[str, Any]:
+    used_kb, powered_kb, total_kb = compute_sram_segment_metrics(seg, bank_kb)
+    d = asdict(seg)
+    d["used_kb"] = round(used_kb, 3)
+    d["powered_kb"] = round(powered_kb, 3)
+    d["total_kb"] = round(total_kb, 3)
+    d["used_pct"] = round((used_kb / total_kb) * 100.0, 2) if total_kb > 0 else 0.0
+    return d
+
+
+def snapshot_to_dict(
+    snap: TelemetrySnapshot,
+    transport: str = "",
+    read_only: bool = False,
+    last_error: str = "",
+    sample_index: int = 0,
+    audio_graph: Optional[dict] = None,
+    probes: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Convert a TelemetrySnapshot (and optional RPC data) into a JSON-serializable dict."""
+    ts = snap.timestamp if snap.timestamp > 0 else time.time()
+    iso_t = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    out: Dict[str, Any] = {
+        "summary": {
+            "sample_index": sample_index,
+            "timestamp": round(ts, 6),
+            "iso_time": iso_t,
+            "connected": bool(snap.connected),
+            "transport": transport,
+            "read_only": bool(read_only),
+            "last_error": last_error,
+            "platform": snap.platform,
+            "fw_filename": snap.fw_filename,
+            "fw_version": snap.fw_version,
+            "ipc_type": snap.ipc_type,
+            "fw_state": snap.fw_state,
+            "fw_state_name": snap.fw_state_name,
+            "dsp_power_state": snap.dsp_power_state,
+            "pm_runtime_active": bool(snap.pm_runtime_active),
+            "num_cores": snap.num_cores,
+            "enabled_cores_mask": snap.enabled_cores_mask,
+            "dsp_clock_hz": snap.dsp_clock_hz,
+            "active_pcm_streams": snap.active_pcm_streams,
+            "tel2_present": bool(snap.tel2_present),
+            "pmw2_present": bool(snap.pmw2_present),
+            "tel2_seq": snap.tel2_seq,
+            "tel2_timestamp_us": snap.tel2_timestamp_us,
+            "total_xrun_events": snap.total_xrun_events,
+        },
+        "regs": {
+            "fw_status": snap.fw_status,
+            "fw_status_hex": f"0x{snap.fw_status:08x}",
+            "lec": snap.lec,
+            "fps": snap.fps,
+            "lnec": snap.lnec,
+            "ltr": snap.ltr,
+            "wire_bytes": snap.wire_bytes,
+            "raw_bytes": snap.raw_bytes,
+        },
+        "cores": [asdict(c) for c in snap.cores],
+        "memory": {
+            "hpsram": _sram_to_dict(snap.hpsram, 128.0),
+            "lpsram": _sram_to_dict(snap.lpsram, 64.0),
+            "sram_used_kb": round(float(snap.sram_used_kb), 3),
+            "sram_powered_kb": round(float(snap.sram_powered_kb), 3),
+            "sram_total_kb": round(float(snap.sram_total_kb), 3),
+            "dram_used_kb": round(float(snap.dram_used_kb), 3),
+            "dram_hwm_kb": round(float(snap.dram_hwm_kb), 3),
+            "dram_total_kb": round(float(snap.dram_total_kb), 3),
+            "heap_allocated_bytes": snap.heap_allocated_bytes,
+            "heap_free_bytes": snap.heap_free_bytes,
+            "heap_max_bytes": snap.heap_max_bytes,
+            "heap_total_bytes": snap.heap_total_bytes,
+            "heap_allocated_kb": round(snap.heap_allocated_bytes / 1024.0, 3),
+            "heap_free_kb": round(snap.heap_free_bytes / 1024.0, 3),
+            "heap_total_kb": round(snap.heap_total_bytes / 1024.0, 3),
+        },
+        "heaps": [asdict(h) for h in snap.heaps],
+        "tasks": [asdict(t) for t in snap.tasks],
+        "components": [asdict(c) for c in snap.components],
+        "io_perf": [
+            {
+                **asdict(io),
+                "utilization_kcps": io.utilization_kcps,
+            }
+            for io in snap.io_perf_items
+        ],
+        "pipelines": [asdict(p) for p in snap.pipelines],
+        "gateways": [asdict(g) for g in snap.gateways],
+        "threads": [asdict(th) for th in snap.threads],
+        "vmh": {
+            "vmh_region_size": snap.vmh_region_size,
+            "vmh_bundle_count": snap.vmh_bundle_count,
+            "vmh_oom_total": snap.vmh_oom_total,
+            "bundles": [asdict(b) for b in snap.vmh_bundles],
+        },
+        "fast_get": asdict(snap.fast_get),
+        "vregion": {
+            "total_pages": snap.vregion_sec.total_pages,
+            "free_pages": snap.vregion_sec.free_pages,
+            "min_free_pages": snap.vregion_sec.min_free_pages,
+            "num_elems_in_use": snap.vregion_sec.num_elems_in_use,
+            "alloc_fail_count": snap.vregion_sec.alloc_fail_count,
+            "region_base_va": snap.vregion_sec.region_base_va,
+            "active_vregion_count": snap.vregion_sec.active_vregion_count,
+            "total_vregions_created": snap.vregion_sec.total_vregions_created,
+            "velems": [
+                {"va": f"0x{va:08x}", "size": sz} for va, sz in snap.vregion_sec.velems
+            ],
+            "vregions": [asdict(vr) for vr in snap.vregion_sec.vregions],
+        },
+        "windows": [asdict(w) for w in snap.windows],
+        "debug_slots": [asdict(ds) for ds in snap.debug_slots],
+        "modules": [
+            {"module_id": mid, "module_id_hex": f"0x{mid:04x}", "name": mname}
+            for mid, mname in sorted(snap.loaded_modules.items())
+        ],
+    }
+    if audio_graph is not None:
+        out["audio"] = audio_graph
+    if probes is not None:
+        out["probes"] = probes
+    return out
+
+
+def expand_selectors(raw_selectors: Sequence[str]) -> List[str]:
+    """Expand presets, aliases, and comma-separated selectors cleanly in order."""
+    if not raw_selectors:
+        return list(ALL_TELEM_SECTIONS)
+
+    tokens: List[str] = []
+    for item in raw_selectors:
+        for part in item.split(","):
+            s = part.strip()
+            if not s:
+                continue
+            if s == "all":
+                tokens.extend(ALL_TELEM_SECTIONS)
+            elif s == "full":
+                tokens.extend(ALL_TELEM_SECTIONS)
+                tokens.extend(RPC_EXTRA_SECTIONS)
+            elif s in ELEMENT_ALIASES:
+                tokens.extend(ELEMENT_ALIASES[s])
+            elif "." in s:
+                head, tail = s.split(".", 1)
+                if head in ELEMENT_ALIASES and len(ELEMENT_ALIASES[head]) == 1:
+                    tokens.append(f"{ELEMENT_ALIASES[head][0]}.{tail}")
+                else:
+                    tokens.append(s)
+            else:
+                tokens.append(s)
+
+    seen = set()
+    ordered: List[str] = []
+    for tok in tokens:
+        if tok not in seen:
+            seen.add(tok)
+            ordered.append(tok)
+    return ordered or list(ALL_TELEM_SECTIONS)
+
+
+def needs_rpc_extras(selectors: Sequence[str]) -> Tuple[bool, bool]:
+    want_audio = any(s == "audio" or s.startswith("audio.") for s in selectors)
+    want_probes = any(s == "probes" or s.startswith("probes.") for s in selectors)
+    return want_audio, want_probes
+
+
+def _validate_selector_root(root: str) -> None:
+    valid = set(ALL_TELEM_SECTIONS) | set(RPC_EXTRA_SECTIONS)
+    if root not in valid:
+        raise ValueError(
+            f"Unknown telemetry element '{root}'. Run --list-elements to inspect valid names."
+        )
+
+
+def _merge_selected_tree(dst: Any, src: Any, parts: Sequence[str]) -> Any:
+    """Extract dotted path `parts` from `src` and merge recursively into `dst`."""
+    if not parts:
+        return src
+    head = parts[0]
+    tail = parts[1:]
+
+    if isinstance(src, list):
+        if dst is None:
+            dst = [None] * len(src)
+        out_list = list(dst)
+        while len(out_list) < len(src):
+            out_list.append(None)
+        for idx, elem in enumerate(src):
+            out_list[idx] = _merge_selected_tree(out_list[idx], elem, parts)
+        return out_list
+
+    if not isinstance(src, dict):
+        return src
+
+    if head not in src:
+        raise ValueError(f"Unknown telemetry field '{head}'")
+
+    cur_dst = dict(dst) if isinstance(dst, dict) else {}
+    cur_dst[head] = _merge_selected_tree(cur_dst.get(head), src[head], tail)
+    return cur_dst
+
+
+def apply_selection(data: Dict[str, Any], selectors: Sequence[str]) -> Dict[str, Any]:
+    """Project `data` onto requested selectors / dotted field paths."""
+    result: Dict[str, Any] = {}
+    for sel in selectors:
+        parts = [p for p in sel.split(".") if p]
+        if not parts:
+            continue
+        _validate_selector_root(parts[0])
+        if parts[0] not in data:
+            result[parts[0]] = None
+            continue
+        result = _merge_selected_tree(result, data, parts)
+    return result
+
+
+def parse_filters(filter_args: Sequence[str]) -> List[Tuple[str, str]]:
+    filters: List[Tuple[str, str]] = []
+    for expr in filter_args:
+        if "=" not in expr:
+            raise ValueError(f"Invalid --filter '{expr}' (expected KEY=VALUE)")
+        k, v = expr.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            raise ValueError(f"Empty key in --filter '{expr}'")
+        filters.append((k, v))
+    return filters
+
+
+def _match_filter_value(actual: Any, target_str: str) -> bool:
+    if isinstance(actual, bool):
+        return str(actual).lower() == target_str.lower() or (
+            actual and target_str == "1"
+        ) or ((not actual) and target_str == "0")
+    if isinstance(actual, int):
+        try:
+            return actual == int(target_str, 0)
+        except ValueError:
+            pass
+    return str(actual).lower() == target_str.lower()
+
+
+def _is_active_row(section: str, row: Dict[str, Any]) -> bool:
+    if section == "cores":
+        return bool(row.get("enabled", False)) or row.get("avg_kcps", 0) > 0 or row.get("tick_count", 0) > 0
+    if section == "tasks":
+        return (
+            row.get("status") not in ("REMOVED", "GATED", "IDLE")
+            or row.get("cpu_pct", 0.0) > 0.0
+            or row.get("avg_kcps", 0) > 0
+        )
+    if section == "components":
+        return (not row.get("is_removed", False)) and (
+            row.get("avg_kcps", 0) > 0 or row.get("iterations", 0) > 0
+        )
+    if section == "io_perf":
+        return row.get("perf_usage", 0) > 0
+    if section == "pipelines":
+        return str(row.get("status_name", "")).upper() in ("RUNNING", "READY", "ACTIVE") or row.get("comp_count", 0) > 0
+    if section == "gateways":
+        return row.get("state", 0) > 0 or row.get("period_bytes", 0) > 0
+    if section == "threads":
+        return row.get("cpu_load_pct", 0.0) > 0.0 or row.get("total_exec_kcycles", 0) > 0
+    return True
+
+
+def apply_filters(
+    data: Dict[str, Any],
+    filters: Sequence[Tuple[str, str]],
+    active_only: bool = False,
+) -> Dict[str, Any]:
+    """Filter list sections by KEY=VALUE and/or --active-only cleanly."""
+    if not filters and not active_only:
+        return data
+
+    out: Dict[str, Any] = {}
+    for sec, val in data.items():
+        if isinstance(val, list):
+            kept = []
+            for item in val:
+                if not isinstance(item, dict):
+                    kept.append(item)
+                    continue
+                if active_only and not _is_active_row(sec, item):
+                    continue
+                matched = True
+                for fk, fv in filters:
+                    if fk in item and not _match_filter_value(item[fk], fv):
+                        matched = False
+                        break
+                if matched:
+                    kept.append(item)
+            out[sec] = kept
+        else:
+            out[sec] = val
+    return out
+
+
+def _flatten_kv(prefix: str, obj: Any, lines: List[Tuple[str, Any]]) -> None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            sub = f"{prefix}.{k}" if prefix else str(k)
+            _flatten_kv(sub, v, lines)
+    elif isinstance(obj, list):
+        if not obj:
+            lines.append((prefix, "[]"))
+        elif all(not isinstance(x, (dict, list)) for x in obj):
+            lines.append((prefix, ",".join(str(x) for x in obj)))
+        else:
+            for idx, item in enumerate(obj):
+                _flatten_kv(f"{prefix}[{idx}]", item, lines)
+    else:
+        lines.append((prefix, obj))
+
+
+def _unwrap_single_scalar(obj: Any) -> Tuple[bool, Any]:
+    """If `obj` holds a single scalar leaf through nested 1-key dicts, return (True, val)."""
+    cur = obj
+    while isinstance(cur, dict):
+        if len(cur) != 1:
+            return False, None
+        cur = next(iter(cur.values()))
+    if isinstance(cur, (list, dict)):
+        return False, None
+    return True, cur
+
+
+def _format_cell(val: Any, key: str = "") -> str:
+    if isinstance(val, float):
+        if key == "timestamp":
+            return f"{val:.3f}"
+        return f"{val:.2f}"
+    if isinstance(val, bool):
+        return "yes" if val else "no"
+    if isinstance(val, (list, dict)):
+        return json.dumps(val, separators=(",", ":"))
+    return str(val)
+
+
+def _format_table(title: str, rows: List[Any], explicit: bool) -> List[str]:
+    if not rows:
+        return [f"[{title}] (0 entries)"] if explicit else []
+    if not all(isinstance(r, dict) for r in rows):
+        vals = ", ".join(_format_cell(r) for r in rows)
+        return [f"[{title}] ({len(rows)}): {vals}"]
+
+    cols: List[str] = []
+    seen = set()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                cols.append(k)
+    # Trim ultra-verbose nested lists in wide default view only if many columns exist
+    rendered_rows: List[List[str]] = []
+    for r in rows:
+        rendered_rows.append([_format_cell(r.get(c, "")) for c in cols])
+
+    widths = [len(c) for c in cols]
+    for rvals in rendered_rows:
+        for i, cell in enumerate(rvals):
+            widths[i] = min(44, max(widths[i], len(cell)))
+
+    def _fmt_row(vals: Sequence[str]) -> str:
+        return "  ".join(
+            (v[: widths[i] - 1] + "~" if len(v) > widths[i] else v).ljust(widths[i])
+            for i, v in enumerate(vals)
+        ).rstrip()
+
+    out = [f"[{title}] ({len(rows)})"]
+    out.append("  " + _fmt_row([c.upper() for c in cols]))
+    out.append("  " + "-" * min(120, sum(widths) + 2 * max(0, len(widths) - 1)))
+    for rvals in rendered_rows:
+        out.append("  " + _fmt_row(rvals))
+    return out
+
+
+def _format_kv_block(title: str, mapping: Dict[str, Any]) -> List[str]:
+    lines = [f"[{title}]"]
+    flat: List[Tuple[str, Any]] = []
+    _flatten_kv("", mapping, flat)
+    if not flat:
+        lines.append("  (empty)")
+        return lines
+    k_w = min(36, max(len(k) for k, _ in flat))
+    for k, v in flat:
+        lines.append(f"  {k:<{k_w}} : {_format_cell(v, key=k)}")
+    return lines
+
+
+def format_text(
+    payload: Dict[str, Any],
+    explicit_sections: bool,
+    raw: bool = False,
+) -> str:
+    if raw:
+        ok, scalar = _unwrap_single_scalar(payload)
+        if ok:
+            return str(scalar)
+        kv_lines: List[Tuple[str, Any]] = []
+        _flatten_kv("", payload, kv_lines)
+        return "\n".join(str(v) for _, v in kv_lines)
+
+    blocks: List[str] = []
+    summ = payload.get("summary")
+    if isinstance(summ, dict) and {"platform", "fw_state_name", "iso_time"}.issubset(summ.keys()):
+        pm = "D0i0 ACTIVE" if summ.get("pm_runtime_active") else "D3 SLEEP"
+        clk = summ.get("dsp_clock_hz", 0) / 1e6
+        hdr = (
+            f"=== SOF TELEMETRY [{summ.get('sample_index', 0)}] @ {summ.get('iso_time')} | "
+            f"{summ.get('platform', 'unknown')} | {summ.get('fw_filename', '')} "
+            f"v{summ.get('fw_version', '0.0.0.0')} ({summ.get('fw_state_name', '')}) | "
+            f"{pm} @ {clk:.0f} MHz ==="
+        )
+        blocks.append(hdr)
+
+    for sec, val in payload.items():
+        if isinstance(val, list):
+            lines = _format_table(sec.upper(), val, explicit=explicit_sections)
+            if lines:
+                blocks.append("\n".join(lines))
+        elif isinstance(val, dict):
+            # Render nested bundle/vregion lists cleanly if present
+            list_subkeys = {k: v for k, v in val.items() if isinstance(v, list) and v and isinstance(v[0], dict)}
+            if list_subkeys:
+                scalar_sub = {k: v for k, v in val.items() if k not in list_subkeys}
+                if scalar_sub:
+                    blocks.append("\n".join(_format_kv_block(sec.upper(), scalar_sub)))
+                for sk, sv in list_subkeys.items():
+                    tlines = _format_table(f"{sec.upper()}.{sk.upper()}", sv, explicit=explicit_sections)
+                    if tlines:
+                        blocks.append("\n".join(tlines))
+            else:
+                blocks.append("\n".join(_format_kv_block(sec.upper(), val)))
+        elif val is not None:
+            blocks.append(f"{sec}: {_format_cell(val)}")
+
+    return "\n\n".join(blocks)
+
+
+def format_kv(payload: Dict[str, Any], raw: bool = False) -> str:
+    if raw:
+        ok, scalar = _unwrap_single_scalar(payload)
+        if ok:
+            return str(scalar)
+    lines: List[Tuple[str, Any]] = []
+    _flatten_kv("", payload, lines)
+    out: List[str] = []
+    for k, v in lines:
+        if isinstance(v, (list, dict)):
+            out.append(f"{k}={json.dumps(v, separators=(',', ':'))}")
+        else:
+            out.append(f"{k}={v}")
+    return "\n".join(out)
+
+
+def print_elements_catalog():
+    print("Selectable telemetry elements (-e / --select):\n")
+    print("  Presets:")
+    print("    all          All TelemetrySnapshot sections (default; fast single poll)")
+    print("    full         All sections + remote-only audio graph & probes")
+    print("\n  Sections:")
+    for k, desc in ELEMENT_CATALOG.items():
+        print(f"    {k:<12} {desc}")
+    print("\n  Shorthand Aliases:")
+    for k, targets in ELEMENT_ALIASES.items():
+        print(f"    {k:<12} -> {', '.join(targets)}")
+    print("\n  Dotted Paths & Filters (examples):")
+    print("    -e summary.platform,summary.fw_state_name,memory.hpsram.used_kb")
+    print("    -e cores.core_id,cores.cpu_load_pct,cores.avg_kcps")
+    print("    -e tasks.task_id,tasks.name,tasks.status,tasks.cpu_pct --active-only")
+    print("    -e components --filter core_id=0 --format jsonl")
+
+
+def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        prog="sof-top-cli",
+        description="Command-line SOF DSP telemetry extractor (snapshots & live streams)",
+    )
+    ap.add_argument("-H", "--host", default="", help="Remote host[:port] running sof_remote_server")
+    ap.add_argument("-p", "--port", type=int, default=SOF_NET_DEFAULT_PORT, help="Remote TCP port (default: 9998)")
+    ap.add_argument(
+        "-l",
+        "--local",
+        nargs="?",
+        const="auto",
+        default="",
+        help="Read telemetry from local host (DebugFS/SysFS read-only default, or /dev/sof-dsp0)",
+    )
+    ap.add_argument("-w", "--wake", action="store_true", help="Wake/boot DSP before sampling (TCP / CDEV only)")
+    ap.add_argument("--hold-d0", action="store_true", help="Hold D0i0 runtime PM across run and release on exit")
+    ap.add_argument("--no-perf", action="store_true", help="Do not send IPC4 perf measurement enable")
+    ap.add_argument("--warmup-ms", type=int, default=120, help="Warmup delta delay in ms before sample 0 (0 to skip; default: 120)")
+    ap.add_argument("--snapshot", action="store_true", help="Capture 1 telemetry snapshot and exit (default)")
+    ap.add_argument("--stream", action="store_true", help="Stream telemetry samples continuously until Ctrl+C / limit")
+    ap.add_argument("-n", "--count", type=int, default=None, help="Sample count (1=snapshot, 0=infinite stream)")
+    ap.add_argument("-i", "--interval", type=int, default=250, help="Stream poll interval in ms (default: 250)")
+    ap.add_argument("-d", "--duration", type=float, default=0.0, help="Stop streaming after SEC seconds")
+    ap.add_argument("--watch", action="store_true", help="ANSI live-refresh screen in TTY text stream mode")
+    ap.add_argument(
+        "-e",
+        "--select",
+        "--elements",
+        action="append",
+        default=[],
+        help="Comma-separated sections or dot-paths to extract (e.g. cores,memory.hpsram,tasks.name)",
+    )
+    ap.add_argument("--filter", action="append", default=[], help="Filter list rows with KEY=VAL (repeatable)")
+    ap.add_argument("--active-only", action="store_true", help="Omit idle/removed/zero-load entries in list sections")
+    ap.add_argument("-f", "--format", choices=("text", "json", "jsonl", "kv"), default="text", help="Output format (default: text)")
+    ap.add_argument("-r", "--raw", action="store_true", help="Emit bare scalar value(s) cleanly for shell scripting")
+    ap.add_argument("-o", "--output", default="-", help="Output file path (default: '-' stdout)")
+    ap.add_argument("--card-id", type=int, default=0, help="ALSA card index when selecting -e audio (default: 0)")
+    ap.add_argument("--list-elements", action="store_true", help="List selectable elements/fields and exit")
+    return ap.parse_args(argv)
+
+
+def _resolve_target(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
+    if args.host:
+        t = f"{args.host}:{args.port}" if ":" not in args.host else args.host
+        return t, None
+    if args.local:
+        return f"local:{args.local}", None
+    probe = probe_local_sof_device()
+    if probe.get("available"):
+        return "local:auto", None
+    return None, str(probe.get("reason") or "No local SOF device detected")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Avoid BrokenPipeError tracebacks when piped to `head` / `jq`
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    args = _parse_args(argv)
+    if args.list_elements:
+        print_elements_catalog()
+        return 0
+
+    try:
+        selectors = expand_selectors(args.select)
+        for s in selectors:
+            _validate_selector_root(s.split(".", 1)[0])
+        filters = parse_filters(args.filter)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    target, probe_err = _resolve_target(args)
+    if not target:
+        msg = f"{probe_err}. Pass --host HOST[:PORT] or --local."
+        if args.format in ("json", "jsonl"):
+            print(json.dumps({"error": msg}), file=sys.stderr)
+        else:
+            print(f"ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    # Determine sample count: --snapshot wins unless --stream or -n/-d specifies otherwise
+    if args.snapshot:
+        count = 1
+    elif args.count is not None:
+        count = max(0, args.count)
+    elif args.stream or args.duration > 0.0:
+        count = 0
+    else:
+        count = 1
+
+    backend = build_backend_for_target(target, args.port)
+    if not backend.connect():
+        err = getattr(backend, "last_error", "") or "connection failed"
+        msg = f"Failed to connect to {target}: {err}"
+        if args.format in ("json", "jsonl"):
+            print(json.dumps({"error": msg}), file=sys.stderr)
+        else:
+            print(f"ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    out_fh = sys.stdout
+    close_out = False
+    if args.output and args.output != "-":
+        out_fh = open(args.output, "w", encoding="utf-8")
+        close_out = True
+
+    stop_flag = False
+
+    def _on_sig(_sig, _frame):
+        nonlocal stop_flag
+        stop_flag = True
+
+    signal.signal(signal.SIGINT, _on_sig)
+    signal.signal(signal.SIGTERM, _on_sig)
+
+    is_ro = bool(getattr(backend, "is_read_only", False))
+    held_d0 = False
+    want_audio, want_probes = needs_rpc_extras(selectors)
+    explicit_sections = bool(args.select) and not any(x in ("all", "full") for x in args.select)
+
+    try:
+        if (args.wake or args.hold_d0) and not is_ro:
+            op = SOF_PM_OP_BOOT_DSP if args.wake else SOF_PM_OP_WAKE_HOLD
+            backend.pm_control(op)
+            held_d0 = True
+            if not args.no_perf:
+                backend.set_perf_measurement_state(2)
+
+        # Warmup poll so tick-rate deltas populate even on a single snapshot
+        if count == 1 and args.warmup_ms > 0:
+            s0 = backend.poll_telemetry(force_full=True, wake_dsp=(args.wake and not is_ro))
+            if s0.connected and s0.pm_runtime_active and s0.fw_state == 7 and not is_ro and not args.no_perf:
+                backend.set_perf_measurement_state(2)
+            time.sleep(max(0.01, args.warmup_ms / 1000.0))
+
+        interval_s = max(0.01, args.interval / 1000.0)
+        start_wall = time.monotonic()
+        sample_idx = 0
+        perf_done = False
+        collected_json: List[Dict[str, Any]] = []
+        stream_json_array = args.format == "json" and count != 1 and count > 0
+        effective_format = "jsonl" if (args.format == "json" and count == 0) else args.format
+
+        while not stop_flag:
+            if count > 0 and sample_idx >= count:
+                break
+            if args.duration > 0.0 and sample_idx > 0 and (time.monotonic() - start_wall) >= args.duration:
+                break
+
+            tick_start = time.monotonic()
+            snap = backend.poll_telemetry(
+                force_full=True,
+                wake_dsp=((args.wake or args.hold_d0) and not is_ro),
+            )
+            if (
+                not perf_done
+                and not is_ro
+                and not args.no_perf
+                and snap.connected
+                and snap.pm_runtime_active
+                and snap.fw_state == 7
+            ):
+                backend.set_perf_measurement_state(2)
+                perf_done = True
+
+            audio_data = None
+            probe_data = None
+            if isinstance(backend, RemoteTcpBackend) and type(backend) is RemoteTcpBackend:
+                if want_audio:
+                    audio_data = backend.query_audio_graph(card_id=args.card_id)
+                if want_probes:
+                    st_avail, avail_pts = backend.query_probes(active_only=False)
+                    st_act, act_pts = backend.query_probes(active_only=True)
+                    probe_data = {
+                        "available_status": st_avail,
+                        "available": avail_pts,
+                        "active_status": st_act,
+                        "active": act_pts,
+                    }
+            else:
+                if want_audio and audio_data is None:
+                    audio_data = {"note": "audio graph requires remote TCP server (--host)"}
+                if want_probes and probe_data is None:
+                    probe_data = {"note": "probe query requires remote TCP server (--host)"}
+
+            full_dict = snapshot_to_dict(
+                snap,
+                transport=getattr(backend, "transport_label", target),
+                read_only=is_ro,
+                last_error=getattr(backend, "last_error", ""),
+                sample_index=sample_idx,
+                audio_graph=audio_data,
+                probes=probe_data,
+            )
+            filtered_full = apply_filters(full_dict, filters, active_only=args.active_only)
+            filtered = apply_selection(filtered_full, selectors)
+
+            if stream_json_array:
+                collected_json.append(filtered)
+            elif effective_format == "json":
+                out_fh.write(json.dumps(filtered, indent=2) + "\n")
+                out_fh.flush()
+            elif effective_format == "jsonl":
+                out_fh.write(json.dumps(filtered, separators=(",", ":")) + "\n")
+                out_fh.flush()
+            elif effective_format == "kv":
+                if sample_idx > 0 and not args.raw:
+                    out_fh.write("---\n")
+                out_fh.write(format_kv(filtered, raw=args.raw) + "\n")
+                out_fh.flush()
+            else:
+                if args.watch and out_fh.isatty():
+                    out_fh.write("\033[2J\033[H")
+                elif sample_idx > 0:
+                    out_fh.write("\n")
+                out_fh.write(format_text(filtered, explicit_sections=explicit_sections, raw=args.raw) + "\n")
+                out_fh.flush()
+
+            sample_idx += 1
+            if count > 0 and sample_idx >= count:
+                break
+            elapsed = time.monotonic() - tick_start
+            rem = interval_s - elapsed
+            if args.duration > 0.0:
+                rem = min(rem, args.duration - (time.monotonic() - start_wall))
+            if rem > 0 and not stop_flag:
+                time.sleep(rem)
+
+        if stream_json_array:
+            out_fh.write(json.dumps(collected_json, indent=2) + "\n")
+            out_fh.flush()
+    finally:
+        if held_d0 and not is_ro:
+            try:
+                backend.pm_control(SOF_PM_OP_RELEASE_HOLD)
+            except Exception:
+                pass
+        backend.close()
+        if close_out:
+            out_fh.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

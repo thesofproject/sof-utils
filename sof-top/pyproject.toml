@@ -42,4 +42,4 @@ Issues = "https://github.com/thesofproject/sof-utils/issues"
 
 [tool.setuptools]
 py-modules = ["backend", "widgets_cairo"]
-script-files = ["sof-top"]
+script-files = ["sof-top", "sof-top-cli"]
