@@ -27,6 +27,7 @@ from backend import (
     DspTaskItem,
     SramSegmentState,
     TelemetrySnapshot,
+    compute_sram_segment_metrics,
     SOF_CDEV_SLOT_TELEMETRY,
     SOF_CDEV_SLOT_SHELL,
     SOF_CDEV_SLOT_LLEXT_LOAD,
@@ -54,8 +55,34 @@ CORE_COLORS: List[Tuple[float, float, float]] = [
     (0.96, 0.75, 0.20),  # Core 2: Amber Gold
     (0.68, 0.46, 0.96),  # Core 3: Violet
     (0.95, 0.42, 0.62),  # Core 4: Pink
-    (0.45, 0.90, 0.80),  # Core 5: Teal
+    (1.00, 0.52, 0.20),  # Core 5: Orange
+    (0.65, 0.89, 0.18),  # Core 6: Lime
+    (0.44, 0.58, 1.00),  # Core 7: Cobalt Blue
 ]
+
+
+def _make_pango_layout(
+    widget: Optional[Gtk.Widget],
+    cr: cairo.Context,
+    text: str,
+    font_str: str = "Monospace 8.5",
+):
+    if widget is not None:
+        layout = widget.create_pango_layout(text)
+    else:
+        layout = PangoCairo.create_layout(cr)
+        layout.set_text(text, -1)
+    layout.set_font_description(Pango.FontDescription(font_str))
+    return layout
+
+
+def measure_pango_text(
+    widget: Optional[Gtk.Widget],
+    cr: cairo.Context,
+    text: str,
+    font_str: str = "Monospace 8.5",
+) -> Tuple[int, int]:
+    return _make_pango_layout(widget, cr, text, font_str).get_pixel_size()
 
 
 def draw_pango_text(
@@ -72,12 +99,7 @@ def draw_pango_text(
     else:
         cr.set_source_rgb(*color)
 
-    if widget is not None:
-        layout = widget.create_pango_layout(text)
-    else:
-        layout = PangoCairo.create_layout(cr)
-        layout.set_text(text, -1)
-    layout.set_font_description(Pango.FontDescription(font_str))
+    layout = _make_pango_layout(widget, cr, text, font_str)
     cr.move_to(x, y)
     PangoCairo.show_layout(cr, layout)
 
@@ -124,9 +146,11 @@ class UserDashboardRenderer:
         self.heap_kb_hist: Deque[Tuple[float, float]] = collections.deque(maxlen=max_samples)
         self.task_scroll_offset: int = 0
         self.last_max_rows: int = 10
+        self.start_ts: Optional[float] = None
+        self.last_ts: Optional[float] = None
 
     def _prune_old(self, deq: Deque[Tuple[float, float]], cutoff: float):
-        while len(deq) > 1 and deq[0][0] < cutoff:
+        while len(deq) > 2 and deq[1][0] < cutoff:
             deq.popleft()
 
     def scroll_tasks(self, delta_rows: int) -> bool:
@@ -138,9 +162,17 @@ class UserDashboardRenderer:
             return True
         return False
 
+    @staticmethod
+    def _sram_segment_metrics(seg: SramSegmentState, bank_kb: float) -> Tuple[float, float, float]:
+        """Return (used_kb, powered_kb, total_kb) distinguishing page allocation from power gates."""
+        return compute_sram_segment_metrics(seg, bank_kb)
+
     def update_snapshot(self, snap: TelemetrySnapshot):
         self.snap = snap
         ts = snap.timestamp if snap.timestamp > 0 else time.time()
+        if self.start_ts is None:
+            self.start_ts = ts
+        self.last_ts = ts
         cutoff = ts - self.window_seconds
 
         for ct in snap.cores:
@@ -148,8 +180,8 @@ class UserDashboardRenderer:
             deq.append((ts, float(ct.cpu_load_pct)))
             self._prune_old(deq, cutoff)
 
-        hp_kb = float(snap.hpsram.powered_banks * 128)
-        lp_kb = float(snap.lpsram.powered_banks * 64)
+        hp_kb, _, _ = self._sram_segment_metrics(snap.hpsram, 128.0)
+        lp_kb, _, _ = self._sram_segment_metrics(snap.lpsram, 64.0)
         dram_kb = float(snap.dram_used_kb)
         heap_kb = float(snap.heap_allocated_bytes) / 1024.0
 
@@ -166,6 +198,107 @@ class UserDashboardRenderer:
         max_off = max(0, len(snap.tasks) - max(1, self.last_max_rows))
         if self.task_scroll_offset > max_off:
             self.task_scroll_offset = max_off
+
+    def _draw_moving_time_xaxis(
+        self,
+        widget: Optional[Gtk.Widget],
+        cr: cairo.Context,
+        plot_x: float,
+        plot_y: float,
+        plot_w: float,
+        plot_h: float,
+        t_end: float,
+        tick_step: float = 10.0,
+    ):
+        """Render vertical scrolling time gridlines and moving second labels on the X-axis."""
+        start_ts = self.start_ts if self.start_ts is not None else t_end
+        elapsed_end = max(0.0, t_end - start_ts)
+        elapsed_start = elapsed_end - self.window_seconds
+        base_y = plot_y + plot_h
+
+        now_lbl = f"{elapsed_end:.0f}s"
+        now_w, _ = measure_pango_text(widget, cr, now_lbl, "Monospace Bold 6.8")
+        now_x = plot_x + plot_w - now_w
+        draw_pango_text(widget, cr, now_lbl, now_x, base_y + 4.0, "Monospace Bold 6.8", ACCENT_CYAN)
+
+        k_min = math.ceil(elapsed_start / tick_step)
+        k_max = math.floor(elapsed_end / tick_step)
+        for k in range(k_min, k_max + 1):
+            tick_sec = k * tick_step
+            x_frac = (tick_sec - elapsed_start) / self.window_seconds
+            if x_frac < 0.0 or x_frac > 1.0:
+                continue
+            gx = plot_x + x_frac * plot_w
+
+            cr.set_source_rgba(*GRID_LINE)
+            cr.set_line_width(1.0)
+            cr.move_to(gx, plot_y)
+            cr.line_to(gx, base_y)
+            cr.stroke()
+
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.25)
+            cr.move_to(gx, base_y)
+            cr.line_to(gx, base_y + 3.5)
+            cr.stroke()
+
+            lbl = f"{int(round(tick_sec))}s"
+            tw, _ = measure_pango_text(widget, cr, lbl, "Monospace 6.8")
+            lx_txt = gx - tw * 0.5
+            # Skip label if it would clip left edge or overlap live right-edge counter
+            if lx_txt >= plot_x - 4.0 and (lx_txt + tw) < (now_x - 8.0):
+                draw_pango_text(widget, cr, lbl, lx_txt, base_y + 4.0, "Monospace 6.8", TEXT_MUTED)
+
+    def _plot_time_series(
+        self,
+        cr: cairo.Context,
+        samples: List[Tuple[float, float]],
+        plot_x: float,
+        plot_y: float,
+        plot_w: float,
+        plot_h: float,
+        t_end: float,
+        y_max: float,
+        col: Tuple[float, float, float],
+        use_gradient: bool = False,
+        fill_alpha: float = 0.16,
+    ):
+        """Plot a rolling-window time-series clipped to the chart rectangle."""
+        if len(samples) < 2:
+            return
+        t_start = t_end - self.window_seconds
+        pts = []
+        for ts_s, val in samples:
+            x_frac = (ts_s - t_start) / self.window_seconds
+            px = plot_x + x_frac * plot_w
+            norm = min(1.0, max(0.0, val / max(1e-6, y_max)))
+            py = plot_y + plot_h - norm * plot_h
+            pts.append((px, py))
+
+        cr.save()
+        cr.rectangle(plot_x, plot_y, plot_w, plot_h)
+        cr.clip()
+
+        cr.move_to(pts[0][0], plot_y + plot_h)
+        for px, py in pts:
+            cr.line_to(px, py)
+        cr.line_to(pts[-1][0], plot_y + plot_h)
+        cr.close_path()
+        if use_gradient:
+            gfill = cairo.LinearGradient(0, plot_y, 0, plot_y + plot_h)
+            gfill.add_color_stop_rgba(0.0, col[0], col[1], col[2], 0.25)
+            gfill.add_color_stop_rgba(1.0, col[0], col[1], col[2], 0.02)
+            cr.set_source(gfill)
+        else:
+            cr.set_source_rgba(col[0], col[1], col[2], fill_alpha)
+        cr.fill()
+
+        cr.set_source_rgb(*col)
+        cr.set_line_width(2.0)
+        cr.move_to(pts[0][0], pts[0][1])
+        for px, py in pts[1:]:
+            cr.line_to(px, py)
+        cr.stroke()
+        cr.restore()
 
     def render_to_cairo(
         self,
@@ -206,30 +339,47 @@ class UserDashboardRenderer:
             pm_col,
         )
 
-        # Compact Per-Core Live Bars at top of left panel
+        # Compact Per-Core Live Bars at top of left panel (Pango-measured so text stays inside panel)
         bar_area_y = ly + 26.0
         row_h = min(22.0, max(16.0, (top_h * 0.36) / max(1, num_cores)))
+        core_rows = []
+        max_clbl_w = 54.0
+        max_cinfo_w = 180.0
         for idx in range(num_cores):
             ct = (
                 self.snap.cores[idx]
                 if idx < len(self.snap.cores)
                 else CoreTelemetry(core_id=idx, enabled=(idx == 0))
             )
+            st_lbl = "ON " if ct.enabled else "OFF"
+            clbl = f"C{ct.core_id}[{st_lbl}]"
+            eff_kcps = ct.avg_kcps if ct.avg_kcps > 0 else ct.budget_kcps
+            info_s = f"{ct.cpu_load_pct:5.1f}% ({eff_kcps:6,d} KCPS | {ct.ticks_per_sec:4.0f} t/s)"
+            lw, _ = measure_pango_text(widget, cr, clbl, "Monospace Bold 8")
+            iw, _ = measure_pango_text(widget, cr, info_s, "Monospace 7.8")
+            max_clbl_w = max(max_clbl_w, float(lw))
+            max_cinfo_w = max(max_cinfo_w, float(iw))
+            core_rows.append((ct, clbl, info_s))
+
+        bx = lx + 10.0 + max_clbl_w + 8.0
+        bw = max(24.0, (lx + half_w - 10.0) - bx - 8.0 - max_cinfo_w)
+        cr.save()
+        cr.rectangle(lx + 1.0, ly + 1.0, max(1.0, half_w - 2.0), max(1.0, top_h - 2.0))
+        cr.clip()
+
+        for idx, (ct, clbl, info_s) in enumerate(core_rows):
             ry = bar_area_y + idx * row_h
             ccol = CORE_COLORS[idx % len(CORE_COLORS)]
-            st_lbl = "ON " if ct.enabled else "OFF"
             draw_pango_text(
                 widget,
                 cr,
-                f"C{ct.core_id}[{st_lbl}]",
+                clbl,
                 lx + 10,
                 ry + 1,
                 "Monospace Bold 8",
                 ccol if ct.enabled else TEXT_MUTED,
             )
 
-            bx = lx + 72.0
-            bw = max(60.0, half_w - 72.0 - 215.0)
             bh = max(11.0, row_h - 5.0)
             by = ry + 2.0
 
@@ -237,7 +387,6 @@ class UserDashboardRenderer:
             cr.rectangle(bx, by, bw, bh)
             cr.fill()
 
-            eff_kcps = ct.avg_kcps if ct.avg_kcps > 0 else ct.budget_kcps
             pct = min(1.0, max(0.0, ct.cpu_load_pct / 100.0))
             if pct > 0:
                 cr.set_source_rgb(*ccol)
@@ -249,7 +398,6 @@ class UserDashboardRenderer:
             cr.rectangle(bx + 0.5, by + 0.5, bw - 1.0, bh - 1.0)
             cr.stroke()
 
-            info_s = f"{ct.cpu_load_pct:5.1f}% ({eff_kcps:6,d} KCPS | {ct.ticks_per_sec:4.0f} t/s)"
             draw_pango_text(
                 widget,
                 cr,
@@ -264,17 +412,31 @@ class UserDashboardRenderer:
         cplot_x = lx + 48.0
         cplot_y = bar_area_y + num_cores * row_h + 18.0
         cplot_w = max(40.0, half_w - 60.0)
-        cplot_h = max(50.0, (ly + top_h) - cplot_y - 12.0)
+        cplot_h = max(50.0, (ly + top_h) - cplot_y - 24.0)
 
+        leg_w = max(18.0, num_cores * 27.0)
+        mcps_title = "MOVING GRAPH: PER-CORE MCPS / CPU UTILIZATION (60s ROLLING %)"
+        tw_full, _ = measure_pango_text(widget, cr, mcps_title, "Monospace Bold 7.8")
+        if (lx + 10.0 + tw_full + 10.0) > (lx + half_w - leg_w - 10.0):
+            mcps_title = "PER-CORE MCPS / CPU % (60s)"
         draw_pango_text(
             widget,
             cr,
-            "MOVING GRAPH: PER-CORE CPU UTILIZATION (60s ROLLING %)",
+            mcps_title,
             lx + 10,
             cplot_y - 15.0,
             "Monospace Bold 7.8",
             ACCENT_CYAN,
         )
+        # Compact colored legend for every core on the graph header row
+        leg_x = lx + half_w - leg_w - 10.0
+        for cid in range(num_cores):
+            ccol = CORE_COLORS[cid % len(CORE_COLORS)]
+            cr.set_source_rgb(*ccol)
+            cr.rectangle(leg_x, cplot_y - 11.0, 6.0, 6.0)
+            cr.fill()
+            draw_pango_text(widget, cr, f"C{cid}", leg_x + 8.0, cplot_y - 14.5, "Monospace Bold 7.2", ccol)
+            leg_x += 27.0
 
         cr.set_source_rgba(*GRID_LINE)
         cr.set_line_width(1.0)
@@ -284,62 +446,48 @@ class UserDashboardRenderer:
             cr.line_to(cplot_x + cplot_w, gy_line)
             cr.stroke()
 
-        max_pct = 20.0
-        for cid in range(num_cores):
-            deq = self.core_pct_hist.get(cid)
-            if deq:
-                max_pct = max(max_pct, max(v for _, v in deq) * 1.25)
-        max_pct = min(100.0, max(10.0, max_pct))
-
         draw_pango_text(
-            widget, cr, f"{max_pct:4.0f}%", lx + 6, cplot_y - 2, "Monospace 7", TEXT_MUTED
+            widget, cr, "100%", lx + 6, cplot_y - 2, "Monospace 7", TEXT_MUTED
         )
         draw_pango_text(
             widget,
             cr,
-            f"{max_pct*0.5:4.0f}%",
+            " 50%",
             lx + 6,
             cplot_y + cplot_h * 0.5 - 6,
             "Monospace 7",
             TEXT_MUTED,
         )
         draw_pango_text(
-            widget, cr, "   0%", lx + 6, cplot_y + cplot_h - 10, "Monospace 7", TEXT_MUTED
+            widget, cr, "  0%", lx + 6, cplot_y + cplot_h - 10, "Monospace 7", TEXT_MUTED
         )
 
-        for cid in range(num_cores):
+        t_now = self.last_ts if self.last_ts is not None else time.time()
+        self._draw_moving_time_xaxis(widget, cr, cplot_x, cplot_y, cplot_w, cplot_h, t_now)
+
+        # Draw lower-activity cores first so active traces stay clearly visible on top
+        draw_order = sorted(
+            range(num_cores),
+            key=lambda c: (
+                max((v for _, v in self.core_pct_hist.get(c, ())), default=0.0),
+                -c,
+            ),
+        )
+        for cid in draw_order:
             samples = list(self.core_pct_hist.get(cid, []))
-            if len(samples) < 2:
-                continue
-            ccol = CORE_COLORS[cid % len(CORE_COLORS)]
-            t_end = samples[-1][0]
-            t_span = max(0.001, min(self.window_seconds, max(1.0, t_end - samples[0][0])))
-            t_start = t_end - t_span
-            pts = []
-            for ts_s, val in samples:
-                x_frac = min(1.0, max(0.0, (ts_s - t_start) / t_span))
-                px = cplot_x + x_frac * cplot_w
-                norm = min(1.0, max(0.0, val / max_pct))
-                py = cplot_y + cplot_h - norm * cplot_h
-                pts.append((px, py))
-
-            cr.move_to(pts[0][0], cplot_y + cplot_h)
-            for px, py in pts:
-                cr.line_to(px, py)
-            cr.line_to(pts[-1][0], cplot_y + cplot_h)
-            cr.close_path()
-            gfill = cairo.LinearGradient(0, cplot_y, 0, cplot_y + cplot_h)
-            gfill.add_color_stop_rgba(0.0, ccol[0], ccol[1], ccol[2], 0.30)
-            gfill.add_color_stop_rgba(1.0, ccol[0], ccol[1], ccol[2], 0.02)
-            cr.set_source(gfill)
-            cr.fill()
-
-            cr.set_source_rgb(*ccol)
-            cr.set_line_width(2.0)
-            cr.move_to(pts[0][0], pts[0][1])
-            for px, py in pts[1:]:
-                cr.line_to(px, py)
-            cr.stroke()
+            self._plot_time_series(
+                cr,
+                samples,
+                cplot_x,
+                cplot_y,
+                cplot_w,
+                cplot_h,
+                t_now,
+                100.0,
+                CORE_COLORS[cid % len(CORE_COLORS)],
+                use_gradient=True,
+            )
+        cr.restore()
 
         # =====================================================================
         # 2. TOP-RIGHT: Moving Graph — DSP Memory Utilization (SRAM + DRAM)
@@ -350,39 +498,95 @@ class UserDashboardRenderer:
 
         hp = self.snap.hpsram
         lp = self.snap.lpsram
-        hp_pwr_kb = hp.powered_banks * 128.0
-        hp_tot_kb = hp.total_banks * 128.0
-        lp_pwr_kb = lp.powered_banks * 64.0
-        lp_tot_kb = lp.total_banks * 64.0
+        hp_used_kb, hp_pwr_kb, hp_tot_kb = self._sram_segment_metrics(hp, 128.0)
+        lp_used_kb, lp_pwr_kb, lp_tot_kb = self._sram_segment_metrics(lp, 64.0)
         dram_used_kb = self.snap.dram_used_kb
         dram_tot_kb = self.snap.dram_total_kb
         heap_used_kb = self.snap.heap_allocated_bytes / 1024.0
         heap_tot_kb = self.snap.heap_total_bytes / 1024.0
 
+        sram_tot_kb = hp_tot_kb + lp_tot_kb
+        if sram_tot_kb > 0:
+            sram_hdr = f"SRAM Used: {hp_used_kb + lp_used_kb:,.0f}/{sram_tot_kb:,.0f} KB (Pwr {hp_pwr_kb + lp_pwr_kb:,.0f} KB)"
+        else:
+            sram_hdr = "SRAM: N/A (no TEL2/cdev)"
+        dram_hdr = (
+            f"DRAM: {dram_used_kb:,.0f}/{dram_tot_kb:,.0f} KB"
+            if dram_tot_kb > 0
+            else "DRAM: N/A"
+        )
+        cr.save()
+        cr.rectangle(rx + 1.0, ry_panel + 1.0, max(1.0, half_w - 2.0), max(1.0, top_h - 2.0))
+        cr.clip()
+
         draw_pango_text(
             widget,
             cr,
-            f"DSP MEMORY UTILIZATION (SRAM + DRAM) — Total SRAM: {hp_pwr_kb + lp_pwr_kb:,.0f}/{hp_tot_kb + lp_tot_kb:,.0f} KB | DRAM: {dram_used_kb:,.0f}/{dram_tot_kb:,.0f} KB",
+            f"DSP MEMORY UTILIZATION — {sram_hdr} | {dram_hdr}",
             rx + 10,
             ry_panel + 6,
-            "Monospace Bold 9",
+            "Monospace Bold 8.6",
             ACCENT_GREEN,
         )
 
         # 4 Memory Segment Bars: HPSRAM, LPSRAM, DRAM (L3/IMR), DSP Heaps
         mem_rows = [
-            ("HPSRAM (SRAM)", hp_pwr_kb, hp_tot_kb, ACCENT_GREEN, f"{hp.powered_banks}/{hp.total_banks} banks ON"),
-            ("LPSRAM (SRAM)", lp_pwr_kb, lp_tot_kb, ACCENT_CYAN, f"{lp.powered_banks}/{lp.total_banks} banks ON"),
-            ("DRAM (L3/IMR)", dram_used_kb, dram_tot_kb, ACCENT_VIOLET, f"HWM {self.snap.dram_hwm_kb:,.0f} KB"),
-            ("DSP Heaps", heap_used_kb, heap_tot_kb, ACCENT_AMBER, f"Free {self.snap.heap_free_bytes/1024.0:,.0f} KB"),
+            (
+                "HPSRAM (SRAM)",
+                hp_used_kb,
+                hp_pwr_kb,
+                hp_tot_kb,
+                ACCENT_GREEN,
+                f"{hp.powered_banks}/{hp.total_banks} banks ON" if hp.total_banks > 0 else "no TEL2/cdev",
+            ),
+            (
+                "LPSRAM (SRAM)",
+                lp_used_kb,
+                lp_pwr_kb,
+                lp_tot_kb,
+                ACCENT_CYAN,
+                f"{lp.powered_banks}/{lp.total_banks} banks ON" if lp.total_banks > 0 else "no TEL2/cdev",
+            ),
+            (
+                "DRAM (L3/IMR)",
+                dram_used_kb,
+                0.0,
+                dram_tot_kb,
+                ACCENT_VIOLET,
+                f"HWM {self.snap.dram_hwm_kb:,.0f} KB" if dram_tot_kb > 0 else "no TEL2/cdev",
+            ),
+            (
+                "DSP Heaps",
+                heap_used_kb,
+                0.0,
+                heap_tot_kb,
+                ACCENT_AMBER,
+                f"Free {self.snap.heap_free_bytes/1024.0:,.0f} KB" if heap_tot_kb > 0 else "no TEL2/cdev",
+            ),
         ]
+        # Measure actual label & readout pixel widths via Pango so minfo never overflows panel/window
+        mem_rendered = []
+        max_mlbl_w = 90.0
+        max_minfo_w = 180.0
+        for mlbl, m_use, m_pwr, m_tot, mcol, mextra in mem_rows:
+            mfrac = min(1.0, max(0.0, m_use / m_tot)) if m_tot > 0 else 0.0
+            if m_tot > 0:
+                minfo = f"{m_use:,.0f}/{m_tot:,.0f} KB ({mfrac*100:4.1f}%) | {mextra}"
+            else:
+                minfo = f"N/A | {mextra}"
+            lw, _ = measure_pango_text(widget, cr, f"{mlbl:<13}", "Monospace Bold 7.8")
+            iw, _ = measure_pango_text(widget, cr, minfo, "Monospace 7.5")
+            max_mlbl_w = max(max_mlbl_w, float(lw))
+            max_minfo_w = max(max_minfo_w, float(iw))
+            mem_rendered.append((mlbl, m_use, m_pwr, m_tot, mcol, mfrac, minfo))
+
+        mbx = rx + 10.0 + max_mlbl_w + 8.0
+        mbw = max(24.0, (rx + half_w - 10.0) - mbx - 8.0 - max_minfo_w)
         m_row_h = min(21.0, max(16.0, (top_h * 0.36) / len(mem_rows)))
-        for m_i, (mlbl, m_use, m_tot, mcol, mextra) in enumerate(mem_rows):
+        for m_i, (mlbl, m_use, m_pwr, m_tot, mcol, mfrac, minfo) in enumerate(mem_rendered):
             my = bar_area_y + m_i * m_row_h
             draw_pango_text(widget, cr, f"{mlbl:<13}", rx + 10, my + 1, "Monospace Bold 7.8", mcol)
 
-            mbx = rx + 112.0
-            mbw = max(60.0, half_w - 112.0 - 215.0)
             mbh = max(11.0, m_row_h - 5.0)
             mby = my + 2.0
 
@@ -390,7 +594,12 @@ class UserDashboardRenderer:
             cr.rectangle(mbx, mby, mbw, mbh)
             cr.fill()
 
-            mfrac = min(1.0, max(0.0, m_use / m_tot)) if m_tot > 0 else 0.0
+            pfrac = min(1.0, max(0.0, m_pwr / m_tot)) if m_tot > 0 else 0.0
+            if pfrac > 0:
+                cr.set_source_rgba(mcol[0], mcol[1], mcol[2], 0.22)
+                cr.rectangle(mbx, mby, mbw * pfrac, mbh)
+                cr.fill()
+
             if mfrac > 0:
                 cr.set_source_rgb(*mcol)
                 cr.rectangle(mbx, mby, mbw * mfrac, mbh)
@@ -401,14 +610,13 @@ class UserDashboardRenderer:
             cr.rectangle(mbx + 0.5, mby + 0.5, mbw - 1.0, mbh - 1.0)
             cr.stroke()
 
-            minfo = f"{m_use:5.0f}/{m_tot:5.0f} KB ({mfrac*100:4.1f}%) | {mextra}"
             draw_pango_text(widget, cr, minfo, mbx + mbw + 8.0, my + 1, "Monospace 7.5", TEXT_PRIMARY)
 
         # Moving Graph for DSP Memory Utilization (SRAM + DRAM)
         mplot_x = rx + 52.0
         mplot_y = bar_area_y + len(mem_rows) * m_row_h + 18.0
         mplot_w = max(40.0, half_w - 64.0)
-        mplot_h = max(50.0, (ry_panel + top_h) - mplot_y - 12.0)
+        mplot_h = max(50.0, (ry_panel + top_h) - mplot_y - 24.0)
 
         draw_pango_text(
             widget,
@@ -445,39 +653,27 @@ class UserDashboardRenderer:
             widget, cr, "   0K", rx + 6, mplot_y + mplot_h - 10, "Monospace 7", TEXT_MUTED
         )
 
+        self._draw_moving_time_xaxis(widget, cr, mplot_x, mplot_y, mplot_w, mplot_h, t_now)
+
         for series, col in (
             (self.hpsram_kb_hist, ACCENT_GREEN),
             (self.dram_kb_hist, ACCENT_VIOLET),
             (self.heap_kb_hist, ACCENT_AMBER),
             (self.lpsram_kb_hist, ACCENT_CYAN),
         ):
-            s_list = list(series)
-            if len(s_list) < 2:
-                continue
-            t_end = s_list[-1][0]
-            t_span = max(0.001, min(self.window_seconds, max(1.0, t_end - s_list[0][0])))
-            t_start = t_end - t_span
-            pts = []
-            for ts_s, val in s_list:
-                x_frac = min(1.0, max(0.0, (ts_s - t_start) / t_span))
-                px = mplot_x + x_frac * mplot_w
-                py = mplot_y + mplot_h - min(1.0, max(0.0, val / y_max_kb)) * mplot_h
-                pts.append((px, py))
-
-            cr.move_to(pts[0][0], mplot_y + mplot_h)
-            for px, py in pts:
-                cr.line_to(px, py)
-            cr.line_to(pts[-1][0], mplot_y + mplot_h)
-            cr.close_path()
-            cr.set_source_rgba(col[0], col[1], col[2], 0.16)
-            cr.fill()
-
-            cr.set_source_rgb(*col)
-            cr.set_line_width(2.0)
-            cr.move_to(pts[0][0], pts[0][1])
-            for px, py in pts[1:]:
-                cr.line_to(px, py)
-            cr.stroke()
+            self._plot_time_series(
+                cr,
+                list(series),
+                mplot_x,
+                mplot_y,
+                mplot_w,
+                mplot_h,
+                t_now,
+                y_max_kb,
+                col,
+                fill_alpha=0.16,
+            )
+        cr.restore()
 
         # =====================================================================
         # 3. BOTTOM: Unified Scrollable DSP Task List (Resources & Status)

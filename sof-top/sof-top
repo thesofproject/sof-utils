@@ -10,17 +10,19 @@ User Edition features:
   3. Unified DSP Task List with Resources & Status (Modules, RTOS Threads, Schedulers, DAIs)
 
 Usage:
-  sof-top --host aphid --wake
-  sof-top --host dragon-fly --port 9998
-  sof-top --local /dev/sof-dsp0
-  sof-top --host aphid --wake --render-png /tmp/softop_user
+  sof-top
+  sof-top --local
+  sof-top --host <hostname> --wake
+  sof-top --host <hostname> --port 9998 --render-png /tmp/softop_user
 """
 
 import argparse
+import json
 import os
 import sys
 import threading
 import time
+from typing import List, Optional
 
 # Ensure imports resolve from the directory containing sof-top even when invoked via symlink
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -31,15 +33,19 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+gi.require_version("GObject", "2.0")
 gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
-from gi.repository import Gtk, Gdk, GLib
+from gi.repository import Gtk, Gdk, GLib, Gio, GObject
 import cairo
 
 from backend import (
     RemoteTcpBackend,
     LocalCdevBackend,
     TelemetrySnapshot,
+    build_backend_for_target as _build_backend_for_target,
+    probe_local_sof_device,
     SOF_PM_OP_WAKE_HOLD,
     SOF_PM_OP_RELEASE_HOLD,
     SOF_PM_OP_BOOT_DSP,
@@ -95,6 +101,64 @@ entry {
 """
 
 
+class TargetModeItem(GObject.Object):
+    """Selection item for Local vs Remote backend mode dropdown."""
+
+    def __init__(self, key: str, label: str, enabled: bool = True, tooltip: str = ""):
+        super().__init__()
+        self.key = key
+        self.label = label
+        self.enabled = enabled
+        self.tooltip = tooltip
+
+
+def _remote_history_path() -> str:
+    cfg_root = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(cfg_root, "sof-top", "history.json")
+
+
+def _load_remote_history(limit: int = 20) -> List[str]:
+    path = _remote_history_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        hosts = data.get("remote_hosts", []) if isinstance(data, dict) else []
+        out: List[str] = []
+        seen = set()
+        for h in hosts:
+            if isinstance(h, str):
+                s = h.strip()
+                if s and s not in seen and not (s == "local" or s.startswith("local:") or s.startswith("/")):
+                    seen.add(s)
+                    out.append(s)
+                    if len(out) >= limit:
+                        break
+        return out
+    except Exception:
+        return []
+
+
+def _record_remote_history(target: str, limit: int = 20) -> List[str]:
+    s = (target or "").strip()
+    if s.endswith(":9998"):
+        s = s[:-5].strip()
+    if not s or s == "local" or s.startswith("local:") or s.startswith("/"):
+        return _load_remote_history(limit)
+    cur = _load_remote_history(limit)
+    new_list = [s] + [h for h in cur if h != s]
+    new_list = new_list[:limit]
+    path = _remote_history_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"remote_hosts": new_list}, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    return new_list
+
+
 class SofTopUserWindow(Gtk.ApplicationWindow):
     """Main GTK4 Window for sof-top (User Edition)."""
 
@@ -105,6 +169,7 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         )
         self.set_default_size(1440, 880)
         self.args = args
+        self.local_probe = probe_local_sof_device()
         self.backend = None
         self.io_lock = threading.Lock()
         self.poll_in_flight = False
@@ -113,14 +178,29 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         self.poll_interval_ms = args.interval
         self.wake_on_poll = args.wake
         self.holding_d0 = False
+        self._suppress_mode_signal = False
+        self._suppress_rate_signal = False
+        self._suppress_hold_signal = False
 
         self._apply_css()
         self._build_ui()
-        self._connect_backend(args.target)
+        self._sync_pm_buttons(read_only=True, connected=False)
 
-        if self.poll_interval_ms > 0:
-            self.poll_timer_id = GLib.timeout_add(self.poll_interval_ms, self._on_poll_tick)
-        GLib.idle_add(self._poll_once, True)
+        if args.target:
+            self._connect_backend(args.target)
+            if self.poll_interval_ms > 0:
+                self.poll_timer_id = GLib.timeout_add(
+                    self.poll_interval_ms, self._on_poll_tick
+                )
+            GLib.idle_add(self._poll_once, True)
+        else:
+            if self.poll_interval_ms > 0:
+                self.poll_timer_id = GLib.timeout_add(
+                    self.poll_interval_ms, self._on_poll_tick
+                )
+            self._set_status(
+                f"{self.local_probe['reason']} — select Remote Server and enter host[:port]"
+            )
 
     def _apply_css(self):
         provider = Gtk.CssProvider()
@@ -143,20 +223,99 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         target_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         target_box.append(Gtk.Label(label="Target:"))
 
-        self.target_entry = Gtk.Entry()
-        self.target_entry.set_text(self.args.target)
-        self.target_entry.set_width_chars(20)
-        self.target_entry.connect(
-            "activate", lambda e: self._connect_backend(e.get_text().strip())
+        self.mode_store = Gio.ListStore.new(TargetModeItem)
+        local_avail = bool(self.local_probe.get("available", False))
+        local_lbl = "Local Device" if local_avail else "Local Device (Unavailable)"
+        self.mode_store.append(
+            TargetModeItem(
+                "local",
+                local_lbl,
+                enabled=local_avail,
+                tooltip=self.local_probe.get("reason", ""),
+            )
         )
-        target_box.append(self.target_entry)
+        self.mode_store.append(
+            TargetModeItem(
+                "remote",
+                "Remote Server",
+                enabled=True,
+                tooltip="Connect to remote host running sof_remote_server",
+            )
+        )
 
-        btn_conn = Gtk.Button(label="Connect")
-        btn_conn.connect(
-            "clicked", lambda _: self._connect_backend(self.target_entry.get_text().strip())
+        btn_factory = Gtk.SignalListItemFactory()
+        btn_factory.connect("setup", self._on_mode_item_setup)
+        btn_factory.connect("bind", self._on_mode_btn_bind)
+
+        list_factory = Gtk.SignalListItemFactory()
+        list_factory.connect("setup", self._on_mode_item_setup)
+        list_factory.connect("bind", self._on_mode_list_bind)
+
+        self.mode_dropdown = Gtk.DropDown(model=self.mode_store, factory=btn_factory)
+        self.mode_dropdown.set_list_factory(list_factory)
+        target_box.append(self.mode_dropdown)
+
+        self.remote_history: List[str] = _load_remote_history()
+
+        host_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        host_box.add_css_class("linked")
+
+        self.target_entry = Gtk.Entry()
+        self.target_entry.set_placeholder_text("hostname[:9998]")
+        self.target_entry.set_tooltip_text(
+            "Remote server host[:port] running sof_remote_server (default port: 9998)\n"
+            "Example: dut-host:9998 or 192.168.1.50:9998"
         )
-        target_box.append(btn_conn)
+        self.target_entry.set_width_chars(22)
+        self.target_entry.connect("activate", lambda _e: self._on_connect_clicked())
+        host_box.append(self.target_entry)
+
+        self.history_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        hist_scroll = Gtk.ScrolledWindow()
+        hist_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        hist_scroll.set_propagate_natural_height(True)
+        hist_scroll.set_max_content_height(240)
+        hist_scroll.set_min_content_width(210)
+        hist_scroll.set_child(self.history_list_box)
+
+        self.history_popover = Gtk.Popover()
+        self.history_popover.set_child(hist_scroll)
+
+        self.target_hist_btn = Gtk.MenuButton(label="▾")
+        self.target_hist_btn.set_popover(self.history_popover)
+        self.target_hist_btn.set_tooltip_text("Previously connected remote servers")
+        host_box.append(self.target_hist_btn)
+
+        target_box.append(host_box)
+
+        self.btn_conn = Gtk.Button(label="Connect")
+        self.btn_conn.connect("clicked", lambda _: self._on_connect_clicked())
+        target_box.append(self.btn_conn)
         header.pack_start(target_box)
+
+        # Initialize dropdown selection & entry text based on startup args / probe / saved history
+        self._suppress_mode_signal = True
+        if self.args.initial_mode == "remote":
+            self.mode_dropdown.set_selected(1)
+            if self.args.host:
+                host_disp = (
+                    f"{self.args.host}:{self.args.port}"
+                    if self.args.port != 9998
+                    else self.args.host
+                )
+                self.target_entry.set_text(host_disp)
+            elif self.remote_history:
+                self.target_entry.set_text(self.remote_history[0])
+        else:
+            self.mode_dropdown.set_selected(0 if local_avail else 1)
+            if self.args.local and self.args.local != "auto":
+                self.target_entry.set_text(self.args.local)
+            elif self.remote_history:
+                self.target_entry.set_text(self.remote_history[0])
+        self._suppress_mode_signal = False
+        self._refresh_remote_history_popover()
+        self._sync_target_widgets()
+        self.mode_dropdown.connect("notify::selected", self._on_mode_selected)
 
         btn_snap = Gtk.Button(label="Export PNG")
         btn_snap.connect("clicked", self._on_export_png)
@@ -171,27 +330,39 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         toolbar.add_css_class("toolbar-box")
         root_box.append(toolbar)
 
-        btn_wake = Gtk.Button(label="Wake / Boot DSP")
-        btn_wake.connect("clicked", self._on_wake_dsp)
-        toolbar.append(btn_wake)
+        self.btn_wake = Gtk.Button(label="Wake / Boot DSP")
+        self.btn_wake.connect("clicked", self._on_wake_dsp)
+        toolbar.append(self.btn_wake)
 
         self.btn_hold_d0 = Gtk.ToggleButton(label="Hold D0i0")
         self.btn_hold_d0.connect("toggled", self._on_toggle_hold_d0)
         toolbar.append(self.btn_hold_d0)
 
-        self.btn_wake_poll = Gtk.ToggleButton(label="Wake on Poll")
-        self.btn_wake_poll.set_active(self.wake_on_poll)
-        self.btn_wake_poll.connect("toggled", self._on_toggle_wake_poll)
-        toolbar.append(self.btn_wake_poll)
-
         toolbar.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
 
         lbl_rate = Gtk.Label(label="Refresh Rate:")
         toolbar.append(lbl_rate)
-        for ms, txt in [(100, "10Hz"), (250, "4Hz"), (500, "2Hz"), (1000, "1Hz"), (0, "Pause")]:
-            b = Gtk.Button(label=txt)
-            b.connect("clicked", self._on_set_poll_rate, ms)
-            toolbar.append(b)
+        self.poll_rates = [
+            (100, "10 Hz (100 ms)"),
+            (250, "4 Hz (250 ms)"),
+            (500, "2 Hz (500 ms)"),
+            (1000, "1 Hz (1000 ms)"),
+            (0, "Pause"),
+        ]
+        if all(ms != self.poll_interval_ms for ms, _ in self.poll_rates):
+            self.poll_rates.append((self.poll_interval_ms, f"Custom ({self.poll_interval_ms} ms)"))
+        rate_model = Gtk.StringList.new([lbl for _, lbl in self.poll_rates])
+        self.rate_dropdown = Gtk.DropDown(model=rate_model)
+        self.rate_dropdown.set_tooltip_text("Select telemetry refresh rate")
+        sel_rate_idx = next(
+            (i for i, (ms, _) in enumerate(self.poll_rates) if ms == self.poll_interval_ms),
+            1,
+        )
+        self._suppress_rate_signal = True
+        self.rate_dropdown.set_selected(sel_rate_idx)
+        self._suppress_rate_signal = False
+        self.rate_dropdown.connect("notify::selected", self._on_rate_dropdown_changed)
+        toolbar.append(self.rate_dropdown)
 
         toolbar.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
         btn_pgup = Gtk.Button(label="Tasks ▲")
@@ -209,6 +380,176 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         self.status_label.add_css_class("status-bar")
         root_box.append(self.status_label)
 
+    def _on_mode_item_setup(self, _factory, list_item: Gtk.ListItem):
+        lbl = Gtk.Label(xalign=0.0)
+        list_item.set_child(lbl)
+
+    def _on_mode_btn_bind(self, _factory, list_item: Gtk.ListItem):
+        item = list_item.get_item()
+        lbl = list_item.get_child()
+        if item and lbl:
+            lbl.set_text(item.label)
+            if item.tooltip:
+                lbl.set_tooltip_text(item.tooltip)
+
+    def _on_mode_list_bind(self, _factory, list_item: Gtk.ListItem):
+        item = list_item.get_item()
+        lbl = list_item.get_child()
+        if item and lbl:
+            lbl.set_text(item.label)
+            lbl.set_sensitive(item.enabled)
+            if item.tooltip:
+                lbl.set_tooltip_text(item.tooltip)
+        if item and hasattr(list_item, "set_selectable"):
+            list_item.set_selectable(item.enabled)
+        if item and hasattr(list_item, "set_activatable"):
+            list_item.set_activatable(item.enabled)
+
+    def _selected_mode_key(self) -> str:
+        idx = self.mode_dropdown.get_selected()
+        item = self.mode_store.get_item(idx) if idx != Gtk.INVALID_LIST_POSITION else None
+        return item.key if item else "remote"
+
+    def _sync_target_widgets(self):
+        is_remote = self._selected_mode_key() == "remote"
+        self.target_entry.set_sensitive(is_remote)
+        if hasattr(self, "target_hist_btn"):
+            self.target_hist_btn.set_sensitive(is_remote and bool(self.remote_history))
+        self.btn_conn.set_label("Connect" if is_remote else "Refresh")
+
+    def _refresh_remote_history_popover(self):
+        self.remote_history = _load_remote_history()
+        child = self.history_list_box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.history_list_box.remove(child)
+            child = nxt
+        for host in self.remote_history:
+            btn = Gtk.Button(label=host)
+            btn.set_halign(Gtk.Align.FILL)
+            btn.add_css_class("flat")
+            lbl = btn.get_child()
+            if isinstance(lbl, Gtk.Label):
+                lbl.set_xalign(0.0)
+            btn.connect("clicked", self._on_pick_history_host, host)
+            self.history_list_box.append(btn)
+        if hasattr(self, "target_hist_btn"):
+            self.target_hist_btn.set_sensitive(
+                self._selected_mode_key() == "remote" and bool(self.remote_history)
+            )
+
+    def _on_pick_history_host(self, _btn, host: str):
+        self.history_popover.popdown()
+        self.target_entry.set_text(host)
+        if self._selected_mode_key() != "remote":
+            self._suppress_mode_signal = True
+            self.mode_dropdown.set_selected(1)
+            self._suppress_mode_signal = False
+            self._sync_target_widgets()
+        self._connect_backend(host)
+
+    def _remember_remote_host(self, target: str) -> bool:
+        self.remote_history = _record_remote_history(target)
+        self._refresh_remote_history_popover()
+        return False
+
+    def _sync_pm_buttons(
+        self,
+        read_only: bool,
+        connected: Optional[bool] = None,
+        snap: Optional[TelemetrySnapshot] = None,
+    ):
+        if connected is None:
+            connected = snap.connected if snap is not None else (self.backend is not None)
+
+        if not connected or read_only:
+            self.btn_wake.set_sensitive(False)
+            self.btn_hold_d0.set_sensitive(False)
+            if not connected and not read_only and self.backend is not None:
+                tip = "Target disconnected"
+            elif self.backend is None:
+                tip = "No target connected"
+            else:
+                tip = "Read-only local DebugFS/SysFS mode (PM control unavailable)"
+            self.btn_wake.set_tooltip_text(tip)
+            self.btn_hold_d0.set_tooltip_text(tip)
+            if not connected and self.btn_hold_d0.get_active():
+                self._suppress_hold_signal = True
+                self.btn_hold_d0.set_active(False)
+                self._suppress_hold_signal = False
+            return
+
+        if snap is None:
+            self.btn_wake.set_sensitive(False)
+            self.btn_hold_d0.set_sensitive(False)
+            self.btn_wake.set_tooltip_text("Waiting for DSP state...")
+            self.btn_hold_d0.set_tooltip_text("Waiting for DSP state...")
+            return
+
+        dsp_awake_booted = bool(snap.pm_runtime_active and snap.fw_state == 7)
+        self.btn_wake.set_sensitive(not dsp_awake_booted)
+        self.btn_wake.set_tooltip_text(
+            "DSP is already booted and active (D0i0)"
+            if dsp_awake_booted
+            else "Wake DSP to D0i0 and boot firmware"
+        )
+
+        # Sync Hold D0i0 toggle state & allow Hold when DSP is active/booted (or already held to allow release)
+        if self.btn_hold_d0.get_active() != self.holding_d0:
+            self._suppress_hold_signal = True
+            self.btn_hold_d0.set_active(self.holding_d0)
+            self._suppress_hold_signal = False
+
+        can_hold = dsp_awake_booted or self.holding_d0
+        self.btn_hold_d0.set_sensitive(can_hold)
+        self.btn_hold_d0.set_tooltip_text(
+            "Release D0i0 runtime PM hold"
+            if self.holding_d0
+            else (
+                "Hold DSP in D0i0 (prevent D3 runtime suspend)"
+                if dsp_awake_booted
+                else "Wake / Boot DSP before holding D0i0"
+            )
+        )
+
+    def _on_mode_selected(self, _dd, _pspec):
+        if self._suppress_mode_signal:
+            return
+        idx = self.mode_dropdown.get_selected()
+        item = self.mode_store.get_item(idx) if idx != Gtk.INVALID_LIST_POSITION else None
+        if not item:
+            return
+        if item.key == "local" and not item.enabled:
+            self._suppress_mode_signal = True
+            self.mode_dropdown.set_selected(1)
+            self._suppress_mode_signal = False
+            self._sync_target_widgets()
+            self._set_status(item.tooltip or "Local SOF device unavailable")
+            return
+        self._sync_target_widgets()
+        if item.key == "local":
+            spec = getattr(self.args, "local", "") or "auto"
+            self._connect_backend(f"local:{spec}")
+        else:
+            host_txt = self.target_entry.get_text().strip()
+            self.target_entry.grab_focus()
+            if host_txt:
+                self._connect_backend(host_txt)
+            else:
+                self._set_status("Enter remote server host[:port] and click Connect")
+
+    def _on_connect_clicked(self):
+        if self._selected_mode_key() == "local":
+            spec = getattr(self.args, "local", "") or "auto"
+            self._connect_backend(f"local:{spec}")
+            return
+        host_txt = self.target_entry.get_text().strip()
+        if not host_txt:
+            self._set_status("Please enter a remote hostname or IP[:port]")
+            self.target_entry.grab_focus()
+            return
+        self._connect_backend(host_txt)
+
     def _connect_backend(self, target: str):
         self._set_status(f"Connecting to {target}...")
 
@@ -221,29 +562,25 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
                         pass
                     self.backend = None
                 self.perf_meas_initialized = False
+                self.holding_d0 = False
 
                 try:
-                    if target.startswith("/") or target.startswith("local:"):
-                        dev_path = (
-                            target.split("local:", 1)[-1]
-                            if target.startswith("local:")
-                            else target
-                        )
-                        new_be = LocalCdevBackend(dev_path, self.args.port)
-                    else:
-                        if ":" in target:
-                            host, port_s = target.rsplit(":", 1)
-                            port = int(port_s)
-                        else:
-                            host, port = target, self.args.port
-                        new_be = RemoteTcpBackend(host, port)
+                    new_be = _build_backend_for_target(target, self.args.port)
                     ok = new_be.connect()
                     self.backend = new_be
+                    lbl = getattr(new_be, "transport_label", target)
+                    ro = bool(getattr(new_be, "is_read_only", False))
+                    err_note = getattr(new_be, "last_error", "")
+                    GLib.idle_add(self._sync_pm_buttons, ro, ok, None)
                     if ok:
-                        GLib.idle_add(self._set_status, f"Connected to {target}")
+                        if not (target.startswith("local:") or target.startswith("/") or target == "local"):
+                            GLib.idle_add(self._remember_remote_host, target)
+                        msg = f"Connected: {lbl}" + (f" ({err_note})" if err_note else "")
+                        GLib.idle_add(self._set_status, msg)
                         self._poll_once_Async(True)
                     else:
-                        GLib.idle_add(self._set_status, f"Failed to connect to {target}")
+                        msg = f"Failed to connect to {target}" + (f": {err_note}" if err_note else "")
+                        GLib.idle_add(self._set_status, msg)
                 except Exception as e:
                     GLib.idle_add(
                         self._set_status, f"Connection to '{target}' failed: {e}"
@@ -296,22 +633,31 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _apply_snapshot(self, snap: TelemetrySnapshot) -> bool:
+        ro = bool(getattr(self.backend, "is_read_only", False)) if self.backend else True
         if not snap.connected:
+            self._sync_pm_buttons(ro, connected=False, snap=snap)
             self._set_status("Target disconnected — retaining last valid telemetry snapshot")
             return False
 
         self.dashboard.update_snapshot(snap)
+        self._sync_pm_buttons(ro, connected=True, snap=snap)
         pstate = "D0i0 (Active)" if snap.pm_runtime_active else "D3 (Sleep)"
-        hp_kb = snap.hpsram.powered_banks * 128
-        hp_tot_kb = snap.hpsram.total_banks * 128
-        lp_kb = snap.lpsram.powered_banks * 64
-        lp_tot_kb = snap.lpsram.total_banks * 64
+        hp_kb, _, hp_tot_kb = UserDashboardRenderer._sram_segment_metrics(snap.hpsram, 128.0)
+        lp_kb, _, lp_tot_kb = UserDashboardRenderer._sram_segment_metrics(snap.lpsram, 64.0)
+        hp_s = f"{hp_kb:.0f}/{hp_tot_kb:.0f} KB" if hp_tot_kb > 0 else "N/A"
+        lp_s = f"{lp_kb:.0f}/{lp_tot_kb:.0f} KB" if lp_tot_kb > 0 else "N/A"
         self._set_status(
+            f"[{getattr(self.backend, 'transport_label', 'SOF')}] "
             f"Platform: {snap.platform} | FW: v{snap.fw_version} ({snap.fw_state_name}) | "
             f"Power: {pstate} | Cores: 0x{snap.enabled_cores_mask:x}/{snap.num_cores} | "
-            f"HPSRAM: {hp_kb}/{hp_tot_kb} KB | LPSRAM: {lp_kb}/{lp_tot_kb} KB | "
+            f"HPSRAM: {hp_s} | LPSRAM: {lp_s} | "
             f"DRAM (L3/IMR): {snap.dram_used_kb:,.0f}/{snap.dram_total_kb:,.0f} KB | "
             f"Tasks: {len(snap.tasks)}"
+            + (
+                f" | Note: {getattr(self.backend, 'last_error', '')}"
+                if getattr(self.backend, "last_error", "")
+                else ""
+            )
         )
         return False
 
@@ -327,6 +673,8 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_toggle_hold_d0(self, btn: Gtk.ToggleButton):
+        if self._suppress_hold_signal:
+            return
         active = btn.get_active()
 
         def _worker():
@@ -343,9 +691,13 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_toggle_wake_poll(self, btn: Gtk.ToggleButton):
-        self.wake_on_poll = btn.get_active()
-        self._set_status(f"Wake on Poll = {self.wake_on_poll}")
+    def _on_rate_dropdown_changed(self, dd: Gtk.DropDown, _pspec):
+        if self._suppress_rate_signal:
+            return
+        idx = dd.get_selected()
+        if 0 <= idx < len(self.poll_rates):
+            ms, _ = self.poll_rates[idx]
+            self._on_set_poll_rate(None, ms)
 
     def _on_set_poll_rate(self, _btn, ms: int):
         if self.poll_timer_id:
@@ -381,33 +733,36 @@ def render_user_dashboard_to_png(
 
 def run_headless_render(args: argparse.Namespace) -> int:
     target = args.target
-    if target.startswith("/") or target.startswith("local:"):
-        dev_path = target.split("local:", 1)[-1] if target.startswith("local:") else target
-        backend = LocalCdevBackend(dev_path, args.port)
-    else:
-        if ":" in target:
-            host, port_s = target.rsplit(":", 1)
-            port = int(port_s)
-        else:
-            host, port = target, args.port
-        backend = RemoteTcpBackend(host, port)
-
-    if not backend.connect():
-        print(f"ERROR: Could not connect to {target}", file=sys.stderr)
+    if not target:
+        probe = probe_local_sof_device()
+        print(
+            f"ERROR: {probe['reason']}. Pass --host HOST to connect to a remote sof_remote_server.",
+            file=sys.stderr,
+        )
         return 1
 
+    backend = _build_backend_for_target(target, args.port)
+    if not backend.connect():
+        err = getattr(backend, "last_error", "")
+        print(
+            f"ERROR: Could not connect to {target}" + (f" ({err})" if err else ""),
+            file=sys.stderr,
+        )
+        return 1
+
+    is_ro = bool(getattr(backend, "is_read_only", False))
     try:
         dash_r = UserDashboardRenderer()
-        if args.wake:
+        if args.wake and not is_ro:
             backend.pm_control(SOF_PM_OP_WAKE_HOLD)
             backend.set_perf_measurement_state(2)
 
         snap = None
         valid_polls = 0
         for _ in range(6):
-            s = backend.poll_telemetry(force_full=True, wake_dsp=args.wake)
+            s = backend.poll_telemetry(force_full=True, wake_dsp=(args.wake and not is_ro))
             if s.connected:
-                if valid_polls == 0 and s.pm_runtime_active and s.fw_state == 7:
+                if valid_polls == 0 and s.pm_runtime_active and s.fw_state == 7 and not is_ro:
                     backend.set_perf_measurement_state(2)
                 snap = s
                 dash_r.update_snapshot(snap)
@@ -422,19 +777,18 @@ def run_headless_render(args: argparse.Namespace) -> int:
             return 1
 
         out_file = render_user_dashboard_to_png(dash_r, args.render_png)
-        hp_kb = snap.hpsram.powered_banks * 128
-        hp_tot_kb = snap.hpsram.total_banks * 128
-        lp_kb = snap.lpsram.powered_banks * 64
-        lp_tot_kb = snap.lpsram.total_banks * 64
+        hp_kb, hp_pwr_kb, hp_tot_kb = UserDashboardRenderer._sram_segment_metrics(snap.hpsram, 128.0)
+        lp_kb, lp_pwr_kb, lp_tot_kb = UserDashboardRenderer._sram_segment_metrics(snap.lpsram, 64.0)
         print(
             f"Rendered {out_file} "
             f"(platform={snap.platform}, fw=v{snap.fw_version}, state={snap.fw_state} [{snap.fw_state_name}], "
-            f"hpsram={hp_kb}/{hp_tot_kb} KB, lpsram={lp_kb}/{lp_tot_kb} KB, "
+            f"hpsram={hp_kb:.0f}/{hp_tot_kb:.0f} KB [pwr {hp_pwr_kb:.0f} KB], "
+            f"lpsram={lp_kb:.0f}/{lp_tot_kb:.0f} KB [pwr {lp_pwr_kb:.0f} KB], "
             f"dram={snap.dram_used_kb:.0f}/{snap.dram_total_kb:.0f} KB, "
             f"tasks={len(snap.tasks)})"
         )
     finally:
-        if args.wake:
+        if args.wake and not is_ro:
             try:
                 backend.pm_control(SOF_PM_OP_RELEASE_HOLD)
             except Exception:
@@ -445,7 +799,10 @@ def run_headless_render(args: argparse.Namespace) -> int:
 
 class SofTopUserApp(Gtk.Application):
     def __init__(self, args: argparse.Namespace):
-        super().__init__(application_id="org.thesofproject.SofTop")
+        super().__init__(
+            application_id="org.thesofproject.SofTop",
+            flags=Gio.ApplicationFlags.NON_UNIQUE,
+        )
         self.args = args
         self.win = None
 
@@ -460,18 +817,40 @@ def main():
         prog="sof-top",
         description="sof-top — SOF DSP User Monitor (Moving Core & SRAM/DRAM Memory Graphs + DSP Task List)",
     )
-    ap.add_argument("-H", "--host", default="aphid", help="Remote host running sof_remote_server (default: aphid)")
+    ap.add_argument(
+        "-H",
+        "--host",
+        default="",
+        help="Remote host running sof_remote_server (omit to auto-connect locally)",
+    )
     ap.add_argument("-p", "--port", type=int, default=9998, help="Remote TCP port (default: 9998)")
-    ap.add_argument("-l", "--local", default="", help="Local char device path (e.g. /dev/sof-dsp0)")
+    ap.add_argument(
+        "-l",
+        "--local",
+        nargs="?",
+        const="auto",
+        default="",
+        help="Read telemetry directly from local host (DebugFS/SysFS read-only by default, or pass /dev/sof-dsp0)",
+    )
     ap.add_argument("-i", "--interval", type=int, default=250, help="Poll interval in ms (default: 250)")
-    ap.add_argument("-w", "--wake", action="store_true", help="Wake DSP on telemetry poll")
+    ap.add_argument("-w", "--wake", action="store_true", help="Wake DSP on telemetry poll (TCP / CDEV only)")
     ap.add_argument("--render-png", default="", help="Render User Dashboard to PNG and exit")
     args = ap.parse_args()
 
-    if args.local:
+    if args.host:
+        args.initial_mode = "remote"
+        args.target = f"{args.host}:{args.port}" if ":" not in args.host else args.host
+    elif args.local:
+        args.initial_mode = "local"
         args.target = f"local:{args.local}"
     else:
-        args.target = f"{args.host}:{args.port}"
+        probe = probe_local_sof_device()
+        if probe["available"]:
+            args.initial_mode = "local"
+            args.target = "local:auto"
+        else:
+            args.initial_mode = "remote"
+            args.target = ""
 
     if args.render_png:
         sys.exit(run_headless_render(args))
