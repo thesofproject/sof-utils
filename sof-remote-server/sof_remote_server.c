@@ -535,7 +535,7 @@ static int get_sof_card_index(void)
 {
 	discover_sof_pci_device();
 
-	/* 1. Check /sys/bus/pci/devices/<bdf>/sound/card* */
+	/* 1. Check /sys/bus/pci/devices/<bdf>/sound/card* (lowest index, skip probes) */
 	if (g_hw_ctx.found && g_hw_ctx.bdf[0] != '\0') {
 		char snd_path[256];
 		snprintf(snd_path, sizeof(snd_path),
@@ -543,21 +543,25 @@ static int get_sof_card_index(void)
 		DIR *sd = opendir(snd_path);
 		if (sd) {
 			struct dirent *de;
+			int best = -1;
 			unsigned int idx = 0;
 			while ((de = readdir(sd)) != NULL) {
 				if (sscanf(de->d_name, "card%u", &idx) == 1) {
-					closedir(sd);
-					return (int)idx;
+					if (best < 0 || (int)idx < best)
+						best = (int)idx;
 				}
 			}
 			closedir(sd);
+			if (best >= 0)
+				return best;
 		}
 	}
 
-	/* 2. Check /sys/class/sound/card* device symlink for BDF or "sof" */
+	/* 2. Check /sys/class/sound/card* device symlink for BDF or "sof" (skip probes) */
 	DIR *cd = opendir("/sys/class/sound");
 	if (cd) {
 		struct dirent *de;
+		int best = -1;
 		unsigned int idx = 0;
 		while ((de = readdir(cd)) != NULL) {
 			if (sscanf(de->d_name, "card%u", &idx) != 1)
@@ -566,24 +570,29 @@ static int get_sof_card_index(void)
 			snprintf(dev_link, sizeof(dev_link),
 				 "/sys/class/sound/%s/device", de->d_name);
 			if (realpath(dev_link, resolved)) {
+				if (strstr(resolved, "probes") != NULL)
+					continue;
 				if ((g_hw_ctx.found && g_hw_ctx.bdf[0] != '\0' &&
 				     strstr(resolved, g_hw_ctx.bdf) != NULL) ||
 				    strstr(resolved, "sof") != NULL) {
-					closedir(cd);
-					return (int)idx;
+					if (best < 0 || (int)idx < best)
+						best = (int)idx;
 				}
 			}
 		}
 		closedir(cd);
+		if (best >= 0)
+			return best;
 	}
 
-	/* 3. Fallback: scan /proc/asound/cards for an SOF card */
+	/* 3. Fallback: scan /proc/asound/cards for an SOF card (skip sof-probes) */
 	FILE *fp = fopen("/proc/asound/cards", "r");
 	if (fp) {
 		char line[256];
 		while (fgets(line, sizeof(line), fp)) {
 			unsigned int idx = 0;
 			if (sscanf(line, " %u [", &idx) == 1 &&
+			    strstr(line, "probes") == NULL &&
 			    (strstr(line, "sof-") != NULL || strstr(line, "SOF") != NULL)) {
 				fclose(fp);
 				return (int)idx;
@@ -605,24 +614,26 @@ static void trigger_on_demand_dsp_boot(void)
 		return;
 
 	char line[256];
-	uint32_t card = 0, dev = 0;
+	uint32_t cap_card = 0, cap_dev = 0;
+	uint32_t play_card = 0, play_dev = 0;
 	bool found_cap = false, found_play = false;
 
 	while (fgets(line, sizeof(line), fp)) {
 		unsigned int c = 0, d = 0;
 		if (sscanf(line, "%u-%u:", &c, &d) == 2 &&
 		    c == (unsigned int)sof_card) {
-			if (strstr(line, "capture")) {
-				card = c;
-				dev = d;
+			if (!found_cap && strstr(line, "capture")) {
+				cap_card = c;
+				cap_dev = d;
 				found_cap = true;
-				break;
 			}
-			if (strstr(line, "playback") && !found_play) {
-				card = c;
-				dev = d;
+			if (!found_play && strstr(line, "playback")) {
+				play_card = c;
+				play_dev = d;
 				found_play = true;
 			}
+			if (found_cap && found_play)
+				break;
 		}
 	}
 	fclose(fp);
@@ -631,24 +642,26 @@ static void trigger_on_demand_dsp_boot(void)
 		return;
 
 	char pcm_dev[32];
-	snprintf(pcm_dev, sizeof(pcm_dev), "hw:%u,%u", card, dev);
-	uint8_t dummy[4096];
+	uint8_t dummy[8192];
 	memset(dummy, 0, sizeof(dummy));
 	uint32_t frames_io = 0, rms = 0, peak = 0, xruns = 0;
 
 	if (found_cap) {
+		snprintf(pcm_dev, sizeof(pcm_dev), "hw:%u,%u", cap_card, cap_dev);
 		if (alsa_pcm_capture_frames(pcm_dev, SOF_PCM_FMT_S16_LE, 16000, 2,
-					    160, 2, dummy, 160, &frames_io,
+					    320, 2, dummy, 320, &frames_io,
 					    &rms, &peak, &xruns) < 0) {
 			alsa_pcm_capture_frames(pcm_dev, SOF_PCM_FMT_S16_LE, 48000, 2,
-						240, 2, dummy, 240, &frames_io,
+						480, 2, dummy, 480, &frames_io,
 						&rms, &peak, &xruns);
 		}
-	} else {
+	}
+	if (found_play && read_debugfs_fw_state() == 2) {
 		_Atomic uint64_t f_played = 0;
 		_Atomic uint32_t vrms = 0, vpeak = 0;
+		snprintf(pcm_dev, sizeof(pcm_dev), "hw:%u,%u", play_card, play_dev);
 		alsa_pcm_play_frames(pcm_dev, SOF_PCM_FMT_S16_LE, 48000, 2,
-				     240, 2, dummy, 240, NULL, 0,
+				     480, 2, dummy, 480, NULL, 0,
 				     &f_played, &vrms, &vpeak, &xruns);
 	}
 }
@@ -1269,6 +1282,9 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 	 *    idle gap and inflates avg_utilization / peak_utilization beyond max_time_elapsed.
 	 */
 	if (snap->flags_present & SOF_TELEM_FL_TELEM_SLOT) {
+		uint32_t slot_sep = *(const uint32_t *)snap->telem_slot;
+		bool slot_uninit = (slot_sep == 0xFFFFFFFFU);
+
 		for (uint32_t c = 0; c < SOF_TEL_MAX_CORES; c++) {
 			uint32_t *st32 = (uint32_t *)(snap->telem_slot + 4 + c * 32);
 			uint32_t t_cnt   = st32[0];
@@ -1279,8 +1295,18 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 			uint32_t p4k_u   = st32[6];
 			uint32_t p8k_u   = st32[7];
 
-			if (t_cnt == 0xFFFFFFFFU)
+			if (slot_uninit || t_cnt == 0xFFFFFFFFU || snap->dev_info.fw_state != 7) {
+				tstate->prev_core_ticks[c] = 0U;
+				st32[0] = 0U;
+				st32[1] = 0U;
+				st32[2] = 0U;
+				st32[3] = 0U;
+				st32[4] = 0U;
+				st32[5] = 0U;
+				st32[6] = 0U;
+				st32[7] = 0U;
 				continue;
+			}
 
 			bool ticking;
 			if (tstate->has_prev_core_ticks)
@@ -1341,6 +1367,10 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 		for (uint32_t c = 0; c < ncores; c++) {
 			const uint32_t *st32 =
 				(const uint32_t *)(snap->telem_slot + 4 + c * 32);
+			if (st32[0] == 0xFFFFFFFFU || st32[4] == 0xFFFFFFFFU) {
+				core_kcps[c] = 0U;
+				continue;
+			}
 			core_kcps[c] = st32[4]; /* sanitized avg_utilization */
 			if (st32[0] > 0 || st32[4] > 0)
 				core_mask |= (1U << c);
@@ -1482,10 +1512,15 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 				/*
 				 * basefw_mem_state_info emitted an IPC4_LPSRAM_STATE tuple
 				 * with 0 banks (64 KB sram1 / 128 KB SRAM_BANK_SIZE == 0).
+				 * Keep TEL2 live free pages when available; otherwise treat
+				 * pages as unallocated rather than 100% full.
 				 */
+				bool has_tel2_lp = (bias >= 0 && lp_tot_pages > 0);
 				lp_banks = 1U;
-				lp_tot_pages = 16U;
-				lp_free_pages = 0U;
+				if (!has_tel2_lp) {
+					lp_tot_pages = 16U;
+					lp_free_pages = 16U;
+				}
 				lp_pgctl = ~1U;
 			}
 			if (!lp_valid && lp_banks > 0 && lp_banks <= 32 && hp_end > 0 &&
@@ -1534,6 +1569,9 @@ static void synthesize_tlvs_from_windows(struct sof_net_telem_snapshot *snap,
 		for (uint32_t c = 0; c < SOF_TEL_MAX_CORES && count < max_out; c++) {
 			const uint32_t *st32 =
 				(const uint32_t *)(snap->telem_slot + 4 + c * 32);
+			if (st32[0] == 0xFFFFFFFFU || st32[4] == 0xFFFFFFFFU ||
+			    st32[5] == 0xFFFFFFFFU)
+				continue;
 			if (st32[0] == 0 && st32[4] == 0 && c > 0)
 				continue;
 			out_items[count].resource_id = (c << 16);
