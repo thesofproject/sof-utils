@@ -217,7 +217,8 @@ def snapshot_to_dict(
             "active_vregion_count": snap.vregion_sec.active_vregion_count,
             "total_vregions_created": snap.vregion_sec.total_vregions_created,
             "velems": [
-                {"va": f"0x{va:08x}", "size": sz} for va, sz in snap.vregion_sec.velems
+                {"pages": epages, "vpage": evpage}
+                for epages, evpage in snap.vregion_sec.velems
             ],
             "vregions": [asdict(vr) for vr in snap.vregion_sec.vregions],
         },
@@ -359,8 +360,10 @@ def _is_active_row(section: str, row: Dict[str, Any]) -> bool:
     if section == "cores":
         return bool(row.get("enabled", False)) or row.get("avg_kcps", 0) > 0 or row.get("tick_count", 0) > 0
     if section == "tasks":
+        if row.get("status") in ("REMOVED", "GATED", "IDLE"):
+            return False
         return (
-            row.get("status") not in ("REMOVED", "GATED", "IDLE")
+            row.get("status") in ("RUNNING", "ACTIVE", "XRUN!", "CPC_VIOL")
             or row.get("cpu_pct", 0.0) > 0.0
             or row.get("avg_kcps", 0) > 0
         )
@@ -375,6 +378,8 @@ def _is_active_row(section: str, row: Dict[str, Any]) -> bool:
     if section == "gateways":
         return row.get("state", 0) > 0 or row.get("period_bytes", 0) > 0
     if section == "threads":
+        if row.get("flags", 0) & 1:
+            return False
         return row.get("cpu_load_pct", 0.0) > 0.0 or row.get("total_exec_kcycles", 0) > 0
     return True
 
@@ -718,10 +723,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not args.no_perf:
                 backend.set_perf_measurement_state(2)
 
+        def _emit_poll_error(err_str: str) -> int:
+            msg = f"Telemetry read failed for {target}: {err_str or 'disconnected'}"
+            if args.format in ("json", "jsonl"):
+                print(json.dumps({"error": msg}), file=sys.stderr)
+            else:
+                print(f"ERROR: {msg}", file=sys.stderr)
+            return 1
+
         # Warmup poll so tick-rate deltas populate even on a single snapshot
         if count == 1 and args.warmup_ms > 0:
             s0 = backend.poll_telemetry(force_full=True, wake_dsp=(args.wake and not is_ro))
-            if s0.connected and s0.pm_runtime_active and s0.fw_state == 7 and not is_ro and not args.no_perf:
+            if not s0.connected:
+                return _emit_poll_error(getattr(backend, "last_error", ""))
+            if s0.pm_runtime_active and s0.fw_state == 7 and not is_ro and not args.no_perf:
                 backend.set_perf_measurement_state(2)
             time.sleep(max(0.01, args.warmup_ms / 1000.0))
 
@@ -744,11 +759,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 force_full=True,
                 wake_dsp=((args.wake or args.hold_d0) and not is_ro),
             )
+            if not snap.connected:
+                if stream_json_array and collected_json:
+                    out_fh.write(json.dumps(collected_json, indent=2) + "\n")
+                    out_fh.flush()
+                return _emit_poll_error(getattr(backend, "last_error", ""))
             if (
                 not perf_done
                 and not is_ro
                 and not args.no_perf
-                and snap.connected
                 and snap.pm_runtime_active
                 and snap.fw_state == 7
             ):

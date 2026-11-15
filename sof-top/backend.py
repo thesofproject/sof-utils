@@ -15,6 +15,7 @@ import math
 import mmap
 import os
 import re
+import shlex
 import socket
 import struct
 import time
@@ -1675,6 +1676,13 @@ class TelemetryParser:
         return snap
 
 
+def _split_ssh_tokens(val: str) -> List[str]:
+    try:
+        return shlex.split(val, comments=True)
+    except ValueError:
+        return [tok.strip("\"'") for tok in val.split() if tok.strip("\"'")]
+
+
 def _resolve_ssh_hostnames(host: str) -> List[str]:
     """Return connection candidates for *host*, honoring ~/.ssh/config HostName aliases."""
     candidates: List[str] = []
@@ -1698,7 +1706,7 @@ def _resolve_ssh_hostnames(host: str) -> List[str]:
                             break
                         in_match = False
                         matched_hostname = None
-                        pats = val.split()
+                        pats = _split_ssh_tokens(val)
                         pos = [p for p in pats if not p.startswith("!") and p != "*"]
                         neg = [p[1:] for p in pats if p.startswith("!")]
                         stanza_matches = any(fnmatch.fnmatchcase(host, p) for p in pos) and not any(
@@ -1710,7 +1718,9 @@ def _resolve_ssh_hostnames(host: str) -> List[str]:
                         in_match = True
                         stanza_matches = False
                     elif not in_match and stanza_matches and key == "hostname" and not matched_hostname:
-                        matched_hostname = val.split()[0]
+                        tokens = _split_ssh_tokens(val)
+                        if tokens:
+                            matched_hostname = tokens[0].strip("\"'")
             if stanza_matches and matched_hostname and matched_hostname not in candidates:
                 candidates.append(matched_hostname)
         except OSError:
@@ -2389,12 +2399,22 @@ def _discover_sof_pci_and_card() -> dict:
             snd_dir = os.path.join(dev_path, "sound")
             if os.path.isdir(snd_dir):
                 try:
-                    for entry in sorted(os.listdir(snd_dir)):
+                    pci_cards = []
+                    for entry in os.listdir(snd_dir):
                         m = re.match(r"^card(\d+)$", entry)
                         if m:
-                            info["card_index"] = int(m.group(1))
-                            info["card_dev_path"] = dev_path
-                            break
+                            pci_cards.append((int(m.group(1)), entry))
+                    for card_num, entry in sorted(pci_cards):
+                        card_dev = os.path.join(snd_dir, entry, "device")
+                        try:
+                            c_res = os.path.realpath(card_dev)
+                            if "probes" in c_res.lower():
+                                continue
+                        except OSError:
+                            pass
+                        info["card_index"] = card_num
+                        info["card_dev_path"] = dev_path
+                        break
                 except OSError:
                     pass
             break
@@ -2402,18 +2422,22 @@ def _discover_sof_pci_and_card() -> dict:
     # Check /sys/class/sound/card* if card index not resolved yet (e.g. non-PCI SOF)
     if info["card_index"] < 0 and os.path.isdir("/sys/class/sound"):
         try:
-            cards = sorted(os.listdir("/sys/class/sound"))
+            card_entries = []
+            for entry in os.listdir("/sys/class/sound"):
+                m = re.match(r"^card(\d+)$", entry)
+                if m:
+                    card_entries.append((int(m.group(1)), entry))
+            card_entries.sort()
         except OSError:
-            cards = []
-        for entry in cards:
-            m = re.match(r"^card(\d+)$", entry)
-            if not m:
-                continue
+            card_entries = []
+        for card_num, entry in card_entries:
             dev_link = os.path.join("/sys/class/sound", entry, "device")
             try:
                 resolved = os.path.realpath(dev_link)
                 drv = os.path.basename(os.readlink(os.path.join(resolved, "driver")))
             except OSError:
+                continue
+            if "probes" in resolved.lower() or "probes" in drv.lower():
                 continue
             is_sof_drv = (
                 drv.startswith("sof-audio")
@@ -2421,7 +2445,7 @@ def _discover_sof_pci_and_card() -> dict:
                 or drv.startswith("sof-")
             )
             if (info["bdf"] and info["bdf"] in resolved) or is_sof_drv:
-                info["card_index"] = int(m.group(1))
+                info["card_index"] = card_num
                 info["card_dev_path"] = resolved
                 if not info["driver"]:
                     info["driver"] = drv
@@ -2431,6 +2455,8 @@ def _discover_sof_pci_and_card() -> dict:
     if info["card_index"] < 0:
         cards_txt = _read_text_file("/proc/asound/cards")
         for line in cards_txt.splitlines():
+            if "probes" in line.lower():
+                continue
             m = re.match(r"^\s*(\d+)\s+\[[^\]]*\]:\s*(sof(?:-[^\s]+)?)\b", line)
             if m:
                 info["card_index"] = int(m.group(1))
@@ -2605,9 +2631,9 @@ class _LocalSysfsDebugfsReader:
                     int(m.group(3)) & 0xFFFF,
                     int(m.group(4) or 0) & 0xFFFF,
                 )
-        # 2. Mainline binary struct sof_ipc_fw_version (8B sof_ipc_hdr + HHHH major/minor/micro/build)
-        if len(data) >= 16:
-            _, _, maj, min_v, mic, bld = struct.unpack_from("<IIHHHH", data, 0)
+        # 2. Mainline binary struct sof_ipc_fw_version (4B sof_ipc_hdr + HHHH major/minor/micro/build)
+        if len(data) >= 12:
+            _, maj, min_v, mic, bld = struct.unpack_from("<IHHHH", data, 0)
             if maj < 1000 and min_v < 1000:
                 return maj, min_v, mic, bld
         return 0, 0, 0, 0
