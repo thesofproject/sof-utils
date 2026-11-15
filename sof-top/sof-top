@@ -300,7 +300,7 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
             if self.args.host:
                 host_disp = (
                     f"{self.args.host}:{self.args.port}"
-                    if self.args.port != 9998
+                    if (self.args.port != 9998 and ":" not in self.args.host)
                     else self.args.host
                 )
                 self.target_entry.set_text(host_disp)
