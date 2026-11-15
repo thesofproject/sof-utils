@@ -49,6 +49,7 @@ rm -rf %{buildroot}
 %license LICENSE
 %{_bindir}/sof-builder
 %{_bindir}/sof-top
+%{_bindir}/sof-top-cli
 %{_bindir}/sof_remote_server
 %{_bindir}/sof-remote-server
 %{_bindir}/sof-remote

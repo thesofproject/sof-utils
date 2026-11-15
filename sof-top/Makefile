@@ -15,20 +15,23 @@ PY_MODS  := backend.py widgets_cairo.py
 all: check
 
 check:
-	$(PYTHON) -B -m py_compile sof-top $(PY_MODS)
+	$(PYTHON) -B -m py_compile sof-top sof-top-cli $(PY_MODS)
 
 install:
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
 	$(INSTALL) -d "$(DESTDIR)$(APPDIR)"
 	$(INSTALL) -d "$(DESTDIR)$(DESKDIR)"
 	$(INSTALL) -m 0755 sof-top "$(DESTDIR)$(APPDIR)/sof-top"
+	$(INSTALL) -m 0755 sof-top-cli "$(DESTDIR)$(APPDIR)/sof-top-cli"
 	$(INSTALL) -m 0644 $(PY_MODS) "$(DESTDIR)$(APPDIR)/"
 	$(INSTALL) -m 0644 pyproject.toml requirements.txt README.md "$(DESTDIR)$(APPDIR)/"
 	$(INSTALL) -m 0644 desktop/org.thesofproject.SofTop.desktop "$(DESTDIR)$(DESKDIR)/org.thesofproject.SofTop.desktop"
 	ln -sf "$(APPDIR)/sof-top" "$(DESTDIR)$(BINDIR)/sof-top"
+	ln -sf "$(APPDIR)/sof-top-cli" "$(DESTDIR)$(BINDIR)/sof-top-cli"
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/sof-top"
+	rm -f "$(DESTDIR)$(BINDIR)/sof-top-cli"
 	rm -f "$(DESTDIR)$(DESKDIR)/org.thesofproject.SofTop.desktop"
 	rm -rf "$(DESTDIR)$(APPDIR)"
 

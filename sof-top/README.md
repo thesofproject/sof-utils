@@ -2,7 +2,7 @@
 
 Hardware-accelerated **GTK4 + Cairo** real-time Sound Open Firmware (SOF) DSP resource, memory, and task monitor for Linux host systems and remote DUTs (`sof_remote_server`).
 
-`sof-top` connects over `SOFZ`-compressed TCP (`sof_remote_server`) or a local character device (`/dev/sof-dsp0` + DebugFS/SysFS) to provide an immediate, `htop`/`btop`-style view of DSP load, memory footprint, and running tasks.
+`sof-top` tries the local SOF host first (reading read-only from Linux SOF DebugFS/SysFS, `/proc/asound`, or an explicit `/dev/sof-dsp0` character device), and when no local device is available, disables the local option in the UI so you can connect to any remote `sof_remote_server` over `SOFZ`-compressed TCP.
 
 ---
 
@@ -53,25 +53,37 @@ sudo apt install \
 `sof-top` is directly executable (`#!/usr/bin/env python3`, `chmod +x`) — no need to prefix `python3`:
 
 ```bash
-# Launch connected to remote DUT (e.g. aphid):
-./sof-top/sof-top --host aphid --wake
+# Auto-connect to local SOF device via read-only DebugFS/SysFS (or prompt for remote host if none present):
+./sof-top/sof-top
 
-# Connect to a local character device (/dev/sof-dsp0):
+# Explicitly monitor local host (may need sudo if /sys/kernel/debug is mode 0700):
+sudo ./sof-top/sof-top --local
+
+# Connect to a remote DUT running sof_remote_server:
+./sof-top/sof-top --host <hostname> --wake
+
+# Connect to an explicit local character device (/dev/sof-dsp0):
 ./sof-top/sof-top --local /dev/sof-dsp0
 
 # Headless high-DPI PNG snapshot export (for CI or reports):
-./sof-top/sof-top --host aphid --wake --render-png /tmp/softop_user
+./sof-top/sof-top --host <hostname> --wake --render-png /tmp/softop_user
+
+# Command-line snapshot / streaming extractor (`sof-top-cli`, no GTK required):
+./sof-top/sof-top-cli --list-elements
+./sof-top/sof-top-cli --host <hostname> --wake --format json
+./sof-top/sof-top-cli --host <hostname> --wake --stream -n 5 -i 200 --format jsonl -e summary,cores,memory.hpsram
+./sof-top/sof-top-cli --host <hostname> --wake -e tasks.name,tasks.cpu_pct,tasks.avg_kcps --active-only --format text
 ```
 
 ### Command-Line Options
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
-| `-H`, `--host HOST` | `aphid` | Remote DUT hostname or IP running `sof_remote_server` |
+| `-H`, `--host HOST` | *(none)* | Remote DUT hostname or IP running `sof_remote_server` (omit to auto-detect local host) |
 | `-p`, `--port PORT` | `9998` | Remote TCP port for `sof_remote_server` |
-| `-l`, `--local DEV` | *(empty)* | Local character device path (e.g. `/dev/sof-dsp0`) instead of TCP |
+| `-l`, `--local [DEV]` | *(auto)* | Local read-only DebugFS/SysFS telemetry, or explicit device path (e.g. `/dev/sof-dsp0`) |
 | `-i`, `--interval MS` | `250` | Telemetry poll interval in milliseconds |
-| `-w`, `--wake` | `false` | Hold/wake DSP via PM runtime when polling telemetry |
+| `-w`, `--wake` | `false` | Hold/wake DSP via PM runtime when polling telemetry (TCP / CDEV only) |
 | `--render-png PATH` | *(empty)* | Render dashboard headlessly to PNG file and exit |
 
 ---
