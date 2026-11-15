@@ -10,9 +10,11 @@ telemetry parsers for sof-top.
 import collections
 import ctypes
 import fcntl
+import fnmatch
 import math
 import mmap
 import os
+import re
 import socket
 import struct
 import time
@@ -325,6 +327,17 @@ class SramSegmentState:
     total_phys_pages: int = 0
     bank_powered: List[bool] = field(default_factory=list)
     bank_alloc_mask: List[int] = field(default_factory=list)
+
+
+def compute_sram_segment_metrics(seg: SramSegmentState, bank_kb: float) -> Tuple[float, float, float]:
+    """Return (used_kb, powered_kb, total_kb) distinguishing page allocation from power gates."""
+    tot_kb = float(seg.total_banks * bank_kb)
+    pwr_kb = float(seg.powered_banks * bank_kb)
+    if seg.total_phys_pages > 0 and seg.free_phys_pages <= seg.total_phys_pages:
+        used_kb = max(0.0, float(seg.total_phys_pages - seg.free_phys_pages) * 4.0)
+    else:
+        used_kb = pwr_kb
+    return used_kb, pwr_kb, tot_kb
 
 
 @dataclass
@@ -742,7 +755,7 @@ class TelemetryParser:
                 n = tlen // 4
                 kcps_arr = struct.unpack_from(f"<{n}I", val, 0)
                 for cid, kv in enumerate(kcps_arr):
-                    self.cached_core_kcps[cid] = kv
+                    self.cached_core_kcps[cid] = 0 if (kv >= 0xFFFFFF00 or kv > 2_000_000) else kv
 
     @staticmethod
     def _extract_kcps_records(
@@ -1264,22 +1277,8 @@ class TelemetryParser:
 
     def synthesize_fallback_memory_and_tasks(self, snap: TelemetrySnapshot):
         """Populate SRAM totals from measured telemetry and build Unified DSP Task List."""
-        hp = snap.hpsram
-        lp = snap.lpsram
-        hp_tot_kb = hp.total_banks * 128.0
-        hp_pwr_kb = hp.powered_banks * 128.0
-        hp_used_kb = (
-            max(0.0, (hp.total_phys_pages - hp.free_phys_pages) * 4.0)
-            if hp.total_phys_pages >= hp.free_phys_pages and hp.total_phys_pages > 0
-            else hp_pwr_kb
-        )
-        lp_tot_kb = lp.total_banks * 64.0
-        lp_pwr_kb = lp.powered_banks * 64.0
-        lp_used_kb = (
-            max(0.0, (lp.total_phys_pages - lp.free_phys_pages) * 4.0)
-            if lp.total_phys_pages >= hp.free_phys_pages and lp.total_phys_pages > 0
-            else lp_pwr_kb
-        )
+        hp_used_kb, hp_pwr_kb, hp_tot_kb = compute_sram_segment_metrics(snap.hpsram, 128.0)
+        lp_used_kb, lp_pwr_kb, lp_tot_kb = compute_sram_segment_metrics(snap.lpsram, 64.0)
 
         snap.sram_used_kb = hp_used_kb + lp_used_kb
         snap.sram_powered_kb = hp_pwr_kb + lp_pwr_kb
@@ -1525,14 +1524,19 @@ class TelemetryParser:
         snap.cores = []
         for cid in range(snap.num_cores):
             en = bool((snap.enabled_cores_mask >> cid) & 1)
+            raw_budget = self.cached_core_kcps.get(cid, 0)
+            if raw_budget >= 0xFFFFFF00 or raw_budget > clock_khz * 2 or snap.fw_state != 7:
+                raw_budget = 0
             ct = CoreTelemetry(
                 core_id=cid,
                 enabled=en,
-                budget_kcps=self.cached_core_kcps.get(cid, 0),
+                budget_kcps=raw_budget,
             )
+            slot_valid = False
             if (flags_present & SOF_TELEM_FL_TELEM_SLOT) and len(telem_slot) >= 4 + (cid + 1) * 32:
                 (sep,) = struct.unpack_from("<I", telem_slot, 0)
                 if sep in (0x0000C0DE, 0xDEC0AD0B) or sep != 0xFFFFFFFF:
+                    slot_valid = True
                     (
                         t_cnt,
                         last_el,
@@ -1595,8 +1599,8 @@ class TelemetryParser:
                         ct.peak_load_pct = min(
                             100.0, (max(peak_u, eff_kcps) / clock_khz) * 100.0
                         )
-            elif en and ct.budget_kcps > 0:
-                if ct.budget_kcps > clock_khz * 2:
+            if not slot_valid and en and ct.budget_kcps > 0:
+                if ct.budget_kcps >= 0xFFFFFF00 or ct.budget_kcps > clock_khz * 2 or snap.fw_state != 7:
                     ct.budget_kcps = 0
                 ct.cpu_load_pct = min(100.0, (ct.budget_kcps / clock_khz) * 100.0)
                 ct.peak_load_pct = ct.cpu_load_pct
@@ -1671,6 +1675,51 @@ class TelemetryParser:
         return snap
 
 
+def _resolve_ssh_hostnames(host: str) -> List[str]:
+    """Return connection candidates for *host*, honoring ~/.ssh/config HostName aliases."""
+    candidates: List[str] = []
+    ssh_cfg = os.path.expanduser("~/.ssh/config")
+    if host and os.path.isfile(ssh_cfg):
+        try:
+            in_match = False
+            stanza_matches = False
+            matched_hostname: Optional[str] = None
+            with open(ssh_cfg, "r", encoding="utf-8", errors="ignore") as fp:
+                for raw in fp:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = re.split(r"[\s=]+", line, maxsplit=1)
+                    if len(parts) < 2:
+                        continue
+                    key, val = parts[0].lower(), parts[1].strip()
+                    if key == "host":
+                        if stanza_matches and matched_hostname:
+                            break
+                        in_match = False
+                        matched_hostname = None
+                        pats = val.split()
+                        pos = [p for p in pats if not p.startswith("!") and p != "*"]
+                        neg = [p[1:] for p in pats if p.startswith("!")]
+                        stanza_matches = any(fnmatch.fnmatchcase(host, p) for p in pos) and not any(
+                            fnmatch.fnmatchcase(host, n) for n in neg
+                        )
+                    elif key == "match":
+                        if stanza_matches and matched_hostname:
+                            break
+                        in_match = True
+                        stanza_matches = False
+                    elif not in_match and stanza_matches and key == "hostname" and not matched_hostname:
+                        matched_hostname = val.split()[0]
+            if stanza_matches and matched_hostname and matched_hostname not in candidates:
+                candidates.append(matched_hostname)
+        except OSError:
+            pass
+    if host and host not in candidates:
+        candidates.append(host)
+    return candidates
+
+
 # -----------------------------------------------------------------------------
 # Remote TCP Network Backend (connects to sof_remote_server)
 # -----------------------------------------------------------------------------
@@ -1683,17 +1732,21 @@ class RemoteTcpBackend:
         self.parser = TelemetryParser()
         self.poll_counter = 0
         self.last_wire_len = 0
+        self.is_read_only = False
+        self.transport_label = f"Remote ({host}:{port})"
+        self.last_error = ""
 
     def connect(self) -> bool:
         self.close()
-        try:
-            s = socket.create_connection((self.host, self.port), timeout=2.5)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.sock = s
-            return True
-        except Exception:
-            self.sock = None
-            return False
+        for target_host in _resolve_ssh_hostnames(self.host):
+            try:
+                s = socket.create_connection((target_host, self.port), timeout=2.5)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock = s
+                return True
+            except Exception:
+                self.sock = None
+        return False
 
     def close(self):
         if self.sock:
@@ -2225,6 +2278,14 @@ def _ioc(dir_bits: int, magic: int, nr: int, size: int) -> int:
     return (dir_bits << 30) | (size << 16) | (magic << 8) | nr
 
 
+SOF_CDEV_ABI_VERSION = 0x00010000
+
+SOF_CDEV_WIN_FW_REGS = 0
+SOF_CDEV_WIN_OUTBOX = 1
+SOF_CDEV_WIN_DEBUG = 2
+SOF_CDEV_WIN_PERF = 3
+SOF_CDEV_WIN_BY_SLOT_TYPE = 0xFF
+
 SOF_CDEV_IOC_MAGIC = ord("S")
 SOF_IOC_GET_INFO = _ioc(2, SOF_CDEV_IOC_MAGIC, 0x01, 716)
 SOF_IOC_PM_CTL = _ioc(3, SOF_CDEV_IOC_MAGIC, 0x02, 32)
@@ -2232,22 +2293,557 @@ SOF_IOC_IPC_LARGE_CFG = _ioc(3, SOF_CDEV_IOC_MAGIC, 0x11, 32)
 SOF_IOC_WIN_READ = _ioc(3, SOF_CDEV_IOC_MAGIC, 0x21, 32)
 
 
-class LocalCdevBackend(RemoteTcpBackend):
-    """Direct local character-device (/dev/sof-dsp0) ioctl and debugfs/sysfs backend."""
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().strip().rstrip("\x00")
+    except OSError:
+        return ""
 
-    def __init__(self, cdev_path: str = "/dev/sof-dsp0", port: int = SOF_NET_DEFAULT_PORT):
+
+def _read_bin_file(path: str, max_bytes: int = 16384) -> Tuple[Optional[bytes], int]:
+    """Read binary file read-only; returns (data, errno_on_error)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(max_bytes), 0
+    except OSError as e:
+        return None, (e.errno or 5)
+
+
+def _discover_debugfs_sof() -> Tuple[Optional[str], bool]:
+    """Locate /sys/kernel/debug/sof or /d/sof; returns (path, permission_denied)."""
+    perm_denied = False
+    for candidate in ("/sys/kernel/debug/sof", "/d/sof"):
+        try:
+            if os.path.isdir(candidate):
+                os.listdir(candidate)
+                return candidate, False
+        except PermissionError:
+            perm_denied = True
+            return candidate, True
+        except OSError:
+            pass
+    # Also check parent debugfs root permission if /sys/kernel/debug itself is 0700
+    for parent in ("/sys/kernel/debug", "/d"):
+        try:
+            if os.path.ismount(parent) or os.path.isdir(parent):
+                os.listdir(parent)
+        except PermissionError:
+            perm_denied = True
+        except OSError:
+            pass
+    return None, perm_denied
+
+
+def _discover_sof_pci_and_card() -> dict:
+    """Read-only SysFS discovery of local SOF PCI/platform device & ALSA sound card."""
+    info = {
+        "bdf": "",
+        "pci_path": "",
+        "driver": "",
+        "card_index": -1,
+        "card_dev_path": "",
+        "hw_ip_version": 4,
+        "num_cores": 4,
+        "platform": "",
+        "fw_filename": "",
+    }
+    pci_dir = "/sys/bus/pci/devices"
+    if os.path.isdir(pci_dir):
+        try:
+            bdfs = sorted(os.listdir(pci_dir))
+        except OSError:
+            bdfs = []
+        for bdf in bdfs:
+            dev_path = os.path.join(pci_dir, bdf)
+            drv_link = os.path.join(dev_path, "driver")
+            try:
+                drv_target = os.readlink(drv_link)
+            except OSError:
+                continue
+            drv = os.path.basename(drv_target)
+            if not (drv.startswith("sof-audio-pci") or "sof" in drv):
+                continue
+            info["bdf"] = bdf
+            info["pci_path"] = dev_path
+            info["driver"] = drv
+            if "ptl" in drv or "wcl" in drv or "nvl" in drv:
+                info["hw_ip_version"] = 6
+                info["num_cores"] = 5
+            elif "lnl" in drv:
+                info["hw_ip_version"] = 5
+                info["num_cores"] = 5
+            elif "mtl" in drv or "arl" in drv:
+                info["hw_ip_version"] = 4
+                info["num_cores"] = 4
+            else:
+                info["hw_ip_version"] = 2
+                info["num_cores"] = 4
+            if drv.startswith("sof-audio-pci-intel-"):
+                short = drv[len("sof-audio-pci-intel-") :]
+                info["platform"] = f"sof-{short} ({bdf})"
+                info["fw_filename"] = f"sof-{short}.ri"
+            else:
+                info["platform"] = f"{drv} ({bdf})"
+                info["fw_filename"] = "sof.ri"
+            snd_dir = os.path.join(dev_path, "sound")
+            if os.path.isdir(snd_dir):
+                try:
+                    for entry in sorted(os.listdir(snd_dir)):
+                        m = re.match(r"^card(\d+)$", entry)
+                        if m:
+                            info["card_index"] = int(m.group(1))
+                            info["card_dev_path"] = dev_path
+                            break
+                except OSError:
+                    pass
+            break
+
+    # Check /sys/class/sound/card* if card index not resolved yet (e.g. non-PCI SOF)
+    if info["card_index"] < 0 and os.path.isdir("/sys/class/sound"):
+        try:
+            cards = sorted(os.listdir("/sys/class/sound"))
+        except OSError:
+            cards = []
+        for entry in cards:
+            m = re.match(r"^card(\d+)$", entry)
+            if not m:
+                continue
+            dev_link = os.path.join("/sys/class/sound", entry, "device")
+            try:
+                resolved = os.path.realpath(dev_link)
+                drv = os.path.basename(os.readlink(os.path.join(resolved, "driver")))
+            except OSError:
+                continue
+            is_sof_drv = (
+                drv.startswith("sof-audio")
+                or drv.startswith("snd_sof")
+                or drv.startswith("sof-")
+            )
+            if (info["bdf"] and info["bdf"] in resolved) or is_sof_drv:
+                info["card_index"] = int(m.group(1))
+                info["card_dev_path"] = resolved
+                if not info["driver"]:
+                    info["driver"] = drv
+                break
+
+    # Fallback: check /proc/asound/cards specifically for an ALSA driver starting with "sof"
+    if info["card_index"] < 0:
+        cards_txt = _read_text_file("/proc/asound/cards")
+        for line in cards_txt.splitlines():
+            m = re.match(r"^\s*(\d+)\s+\[[^\]]*\]:\s*(sof(?:-[^\s]+)?)\b", line)
+            if m:
+                info["card_index"] = int(m.group(1))
+                if not info["platform"]:
+                    info["platform"] = line.split(":", 1)[-1].strip()[:31]
+                break
+
+    return info
+
+
+def probe_local_sof_device(cdev_path: str = "/dev/sof-dsp0") -> dict:
+    """
+    Check read-only whether a local SOF device is present on this host.
+    Returns status dictionary suitable for CLI diagnostics and UI grey-out logic.
+    """
+    hw = _discover_sof_pci_and_card()
+    dbg_root, dbg_perm_denied = _discover_debugfs_sof()
+    has_cdev = os.path.exists(cdev_path) if cdev_path else False
+    has_pci_or_card = bool(hw["bdf"] or hw["driver"] or hw["card_index"] >= 0)
+    has_debugfs = dbg_root is not None
+
+    # Local device counts as available only if SOF hardware/driver/debugfs/cdev exists
+    available = has_pci_or_card or has_debugfs or has_cdev
+
+    mode = "none"
+    reason = ""
+    if not available:
+        reason = "No local SOF audio device found (no SOF PCI/ALSA device or debugfs)"
+    elif has_debugfs and not dbg_perm_denied:
+        mode = "debugfs"
+        reason = f"Local DebugFS ({dbg_root})" + (f" + SysFS ({hw['bdf']})" if hw["bdf"] else "")
+    elif has_pci_or_card:
+        mode = "sysfs"
+        if dbg_perm_denied:
+            reason = (
+                f"Local SysFS ({hw['bdf'] or hw['platform']}); DebugFS permission denied "
+                f"(run with sudo for full telemetry)"
+            )
+        else:
+            reason = f"Local SysFS ({hw['bdf'] or hw['platform']})"
+    elif has_cdev:
+        mode = "cdev"
+        reason = f"Local CDEV ({cdev_path})"
+
+    return {
+        "available": available,
+        "mode": mode,
+        "has_pci": bool(hw["bdf"]),
+        "has_card": hw["card_index"] >= 0,
+        "has_debugfs": has_debugfs,
+        "debugfs_perm_denied": dbg_perm_denied,
+        "has_cdev": has_cdev,
+        "debugfs_root": dbg_root or "",
+        "bdf": hw["bdf"],
+        "driver": hw["driver"],
+        "platform": hw["platform"],
+        "card_index": hw["card_index"],
+        "reason": reason,
+    }
+
+
+class _LocalSysfsDebugfsReader:
+    """Strictly read-only local host reader via SOF DebugFS, SysFS, ProcFS, and FW .ri manifest."""
+
+    def __init__(self, debugfs_override: str = ""):
+        self.debugfs_override = debugfs_override
+        self.hw: dict = {}
+        self.debugfs_root: Optional[str] = None
+        self.debugfs_perm_denied: bool = False
+        self.cached_fw_mods_tlv: bytes = b""
+        self.fw_mods_scanned: bool = False
+        self.last_note: str = ""
+
+    def discover(self) -> bool:
+        self.hw = _discover_sof_pci_and_card()
+        if self.debugfs_override and os.path.isdir(self.debugfs_override):
+            try:
+                os.listdir(self.debugfs_override)
+                self.debugfs_root = self.debugfs_override
+                self.debugfs_perm_denied = False
+            except PermissionError:
+                self.debugfs_root = self.debugfs_override
+                self.debugfs_perm_denied = True
+        else:
+            self.debugfs_root, self.debugfs_perm_denied = _discover_debugfs_sof()
+
+        has_hw = bool(self.hw["bdf"] or self.hw["driver"] or self.hw["card_index"] >= 0)
+        return has_hw or (self.debugfs_root is not None)
+
+    def _dbg(self, rel: str) -> str:
+        if not self.debugfs_root:
+            return ""
+        return os.path.join(self.debugfs_root, rel)
+
+    def _read_pm_active(self) -> Optional[bool]:
+        for base in (self.hw.get("pci_path", ""), self.hw.get("card_dev_path", "")):
+            if not base:
+                continue
+            st = _read_text_file(os.path.join(base, "power", "runtime_status"))
+            if st == "active":
+                return True
+            if st in ("suspended", "suspending", "resuming"):
+                return False
+        return None
+
+    def _count_running_alsa(self) -> int:
+        card_idx = self.hw.get("card_index", -1)
+        if card_idx < 0:
+            return 0
+        card_dir = f"/proc/asound/card{card_idx}"
+        if not os.path.isdir(card_dir):
+            return 0
+        running = 0
+        try:
+            for pcm in os.listdir(card_dir):
+                if not pcm.startswith("pcm"):
+                    continue
+                pcm_dir = os.path.join(card_dir, pcm)
+                if not os.path.isdir(pcm_dir):
+                    continue
+                for sub in os.listdir(pcm_dir):
+                    if not sub.startswith("sub"):
+                        continue
+                    st_txt = _read_text_file(os.path.join(pcm_dir, sub, "status"))
+                    if "RUNNING" in st_txt:
+                        running += 1
+        except OSError:
+            pass
+        return running
+
+    def _read_fw_state(self) -> int:
+        p = self._dbg("fw_state")
+        if not p:
+            return 0
+        data, err = _read_bin_file(p, 64)
+        if err == 13:
+            self.debugfs_perm_denied = True
+        if not data:
+            return 0
+        if len(data) == 4:
+            (val,) = struct.unpack_from("<I", data, 0)
+            if val <= 16:
+                return val
+        txt = data.decode("ascii", errors="ignore").strip().rstrip("\x00")
+        if txt.isdigit():
+            val = int(txt)
+            if val <= 16:
+                return val
+        if len(data) >= 4:
+            (val,) = struct.unpack_from("<I", data, 0)
+            if val <= 16:
+                return val
+        return 0
+
+    def _read_fw_version(self) -> Tuple[int, int, int, int]:
+        p = self._dbg("fw_version")
+        if not p:
+            return 0, 0, 0, 0
+        data, err = _read_bin_file(p, 256)
+        if err == 13:
+            self.debugfs_perm_denied = True
+        if not data:
+            return 0, 0, 0, 0
+        # 1. Text format fallback ("v2.11.0-1" or "version: 2.11.0.1")
+        if all(32 <= b < 127 or b in (9, 10, 13, 0) for b in data[: min(len(data), 48)]):
+            txt = data.decode("ascii", errors="ignore")
+            m = re.search(r"(\d+)\.(\d+)\.(\d+)(?:[.\-](\d+))?", txt)
+            if m:
+                return (
+                    int(m.group(1)) & 0xFFFF,
+                    int(m.group(2)) & 0xFFFF,
+                    int(m.group(3)) & 0xFFFF,
+                    int(m.group(4) or 0) & 0xFFFF,
+                )
+        # 2. Mainline binary struct sof_ipc_fw_version (8B sof_ipc_hdr + HHHH major/minor/micro/build)
+        if len(data) >= 16:
+            _, _, maj, min_v, mic, bld = struct.unpack_from("<IIHHHH", data, 0)
+            if maj < 1000 and min_v < 1000:
+                return maj, min_v, mic, bld
+        return 0, 0, 0, 0
+
+    def _read_modules_from_fw_ri(self, fw_path: str, fw_name: str) -> bytes:
+        if self.fw_mods_scanned:
+            return self.cached_fw_mods_tlv
+        self.fw_mods_scanned = True
+
+        candidates = []
+        if fw_path and fw_name:
+            candidates.append(f"/lib/firmware/{fw_path}/{fw_name}")
+            candidates.append(f"/vendor/firmware/{fw_path}/{fw_name}")
+        if fw_name:
+            candidates.append(f"/lib/firmware/{fw_name}")
+
+        fw_blob = b""
+        for cand in candidates:
+            if os.path.isfile(cand):
+                try:
+                    with open(cand, "rb") as f:
+                        fw_blob = f.read(16 * 1024 * 1024)
+                    if fw_blob:
+                        break
+                except OSError:
+                    pass
+
+        if not fw_blob:
+            return b""
+
+        entries = bytearray()
+        mod_cnt = 0
+        fsz = len(fw_blob)
+        pos = 0
+        # Scan 4-byte aligned "$AME" module manifest entries (116 bytes each)
+        while mod_cnt < 34:
+            idx = fw_blob.find(b"$AME", pos)
+            if idx < 0 or idx + 116 > fsz:
+                break
+            if idx % 4 == 0 and 65 <= fw_blob[idx + 4] <= 90:
+                entry = bytearray(fw_blob[idx : idx + 116])
+                struct.pack_into("<HH", entry, 0, mod_cnt, 2)
+                entries.extend(entry)
+                mod_cnt += 1
+                pos = idx + 116
+            else:
+                pos = idx + 4
+
+        if mod_cnt > 0:
+            self.cached_fw_mods_tlv = struct.pack("<I", mod_cnt) + bytes(entries[: 4092])
+        return self.cached_fw_mods_tlv
+
+    def poll_raw_snapshot(self, parser: TelemetryParser) -> Optional[bytes]:
+        if not self.hw and not self.debugfs_root:
+            if not self.discover():
+                return None
+
+        fw_path = _read_text_file(self._dbg("fw_profile/fw_path")) if self.debugfs_root else ""
+        fw_name = _read_text_file(self._dbg("fw_profile/fw_name")) if self.debugfs_root else ""
+        ipc_txt = _read_text_file(self._dbg("fw_profile/ipc_type")) if self.debugfs_root else ""
+        ipc_type = int(ipc_txt) if ipc_txt.isdigit() else 1
+
+        fw_state = self._read_fw_state()
+        ver_maj, ver_min, ver_mic, ver_bld = self._read_fw_version()
+
+        pm_active_sys = self._read_pm_active()
+        if pm_active_sys is None:
+            pm_active = (fw_state == 7)
+        else:
+            pm_active = pm_active_sys
+        dsp_pwr_state = 1 if pm_active else 4
+
+        platform = self.hw.get("platform") or ""
+        if not platform and fw_name:
+            platform = f"{os.path.splitext(fw_name)[0]} (local)"
+        elif not platform:
+            platform = "local-sof"
+        fw_filename = fw_name or self.hw.get("fw_filename") or "sof.ri"
+        num_cores = self.hw.get("num_cores", 4)
+        hw_ip = self.hw.get("hw_ip_version", 4)
+        active_pcm = self._count_running_alsa()
+
+        flags_present = 0
+        fw_regs = b"\x00" * 512
+        tel2_slot = b"\x00" * 4096
+        telem_slot_b = b"\x00" * 512
+
+        notes = []
+        if self.debugfs_perm_denied:
+            notes.append("DebugFS permission denied (run with sudo for full telemetry)")
+
+        # Only read D0-only debugfs files when DSP is active (or PM status unavailable)
+        if self.debugfs_root and not self.debugfs_perm_denied and (pm_active_sys is not False):
+            # 1. Window 0 fw_regs
+            r_data, r_err = _read_bin_file(self._dbg("fw_regs"), 512)
+            if r_data and len(r_data) >= 20:
+                if struct.unpack_from("<I", r_data, 0)[0] != 0xFFFFFFFF:
+                    fw_regs = r_data[:512].ljust(512, b"\x00")
+                    flags_present |= SOF_TELEM_FL_FW_REGS
+            elif r_err == 13:
+                notes.append("fw_regs permission denied")
+
+            # 2. MW2 Slot 1 TEL2 (/sys/kernel/debug/sof/exception)
+            exc_data, exc_err = _read_bin_file(self._dbg("exception"), 4096)
+            if exc_data and len(exc_data) >= 256:
+                bias = sof_tel2_slot_bias(exc_data)
+                first_u32 = struct.unpack_from("<I", exc_data, 0)[0]
+                if bias == 4 or (len(exc_data) <= 4092 and first_u32 not in (0x0000C0DE, 0xDEC0AD0B)):
+                    norm = bytearray(4096)
+                    struct.pack_into("<I", norm, 0, 0x0000C0DE)
+                    copy_len = min(len(exc_data), 4092)
+                    norm[4 : 4 + copy_len] = exc_data[:copy_len]
+                    tel2_slot = bytes(norm)
+                else:
+                    tel2_slot = exc_data[:4096].ljust(4096, b"\x00")
+
+                if sof_tel2_slot_bias(tel2_slot) >= 0 or first_u32 != 0xFFFFFFFF:
+                    flags_present |= SOF_TELEM_FL_TELEM_SLOT | SOF_TELEM_FL_TEL2_SLOT
+                    telem_slot = bytearray(512)
+                    if sof_tel2_slot_bias(tel2_slot) == 0:
+                        telem_slot[:4] = tel2_slot[:4]
+                        for c in range(5):
+                            telem_slot[4 + c * 32 : 4 + (c + 1) * 32] = tel2_slot[
+                                4 + c * 40 : 4 + c * 40 + 32
+                            ]
+                    else:
+                        telem_slot[:] = tel2_slot[:512]
+                    telem_slot_b = bytes(telem_slot)
+            elif exc_err == 13:
+                notes.append("exception permission denied")
+
+        enabled_cores_mask = 1 if pm_active else 0
+        if flags_present & SOF_TELEM_FL_TELEM_SLOT:
+            for c in range(min(5, num_cores)):
+                (t_cnt,) = struct.unpack_from("<I", telem_slot_b, 4 + c * 32)
+                (avg_u,) = struct.unpack_from("<I", telem_slot_b, 4 + c * 32 + 16)
+                if t_cnt not in (0, 0xFFFFFFFF) or avg_u not in (0, 0xFFFFFFFF):
+                    enabled_cores_mask |= 1 << c
+
+        # 3. Synthesize module names from firmware .ri manifest (read-only)
+        mod_info_tlv = self._read_modules_from_fw_ri(fw_path, fw_name)
+        if mod_info_tlv:
+            flags_present |= SOF_TELEM_FL_MODULES_INFO_TLV
+
+        self.last_note = "; ".join(notes)
+
+        # Build 716-byte sof_cdev_info header matching parse_cdev_info_into
+        info_hdr = struct.pack(
+            "<IIIIIIIIHHHHI32s64s",
+            SOF_CDEV_ABI_VERSION,
+            ipc_type,
+            fw_state,
+            dsp_pwr_state,
+            1 if pm_active else 0,
+            num_cores,
+            enabled_cores_mask,
+            4096,
+            ver_maj,
+            ver_min,
+            ver_mic,
+            ver_bld,
+            hw_ip,
+            platform.encode("ascii", errors="replace")[:31],
+            fw_filename.encode("ascii", errors="replace")[:63],
+        )
+        info_buf = info_hdr.ljust(716, b"\x00")
+
+        return (
+            info_buf
+            + struct.pack("<II", flags_present, active_pcm)
+            + fw_regs
+            + telem_slot_b
+            + (b"\x00" * 4096)
+            + struct.pack("<I", 0)
+            + (b"\x00" * 2048)
+            + struct.pack("<I", 0)
+            + (b"\x00" * 256)
+            + struct.pack("<I", 0)
+            + (b"\x00" * 4096)
+            + struct.pack("<I", len(mod_info_tlv))
+            + mod_info_tlv[:4096].ljust(4096, b"\x00")
+            + struct.pack("<I", len(tel2_slot) if (flags_present & SOF_TELEM_FL_TEL2_SLOT) else 0)
+            + tel2_slot[:4096].ljust(4096, b"\x00")
+            + struct.pack("<I", 0)
+            + (b"\x00" * 8192)
+        )
+
+
+class LocalCdevBackend(RemoteTcpBackend):
+    """Direct local host backend (read-only DebugFS/SysFS by default, or explicit /dev/sof-dsp* cdev)."""
+
+    def __init__(self, cdev_path: str = "auto", port: int = SOF_NET_DEFAULT_PORT):
         super().__init__("127.0.0.1", port)
-        self.cdev_path = cdev_path
+        self.cdev_path = cdev_path or "auto"
         self.cdev_fd: int = -1
+        self.mode: str = "none"
+        self.is_read_only: bool = True
+        self.transport_label: str = "Local DebugFS/SysFS (Read-Only)"
+        self.last_error: str = ""
+        self._sys_reader: Optional[_LocalSysfsDebugfsReader] = None
 
     def connect(self) -> bool:
         self.close()
-        try:
-            self.cdev_fd = os.open(self.cdev_path, os.O_RDWR)
+        self.last_error = ""
+        spec = self.cdev_path
+
+        # Explicit character device path (e.g. /dev/sof-dsp0)
+        if spec.startswith("/dev/"):
+            try:
+                self.cdev_fd = os.open(spec, os.O_RDWR)
+                self.mode = "cdev"
+                self.is_read_only = False
+                self.transport_label = f"Local CDEV ({spec})"
+                return True
+            except OSError as e:
+                self.cdev_fd = -1
+                self.last_error = f"Cannot open {spec}: {e.strerror or e}"
+                return False
+
+        # Read-only DebugFS + SysFS + ProcFS mode (default for 'auto', 'debugfs', 'sysfs', or debugfs dir)
+        dbg_override = spec if spec.startswith("/") else ""
+        reader = _LocalSysfsDebugfsReader(debugfs_override=dbg_override)
+        if reader.discover():
+            self._sys_reader = reader
+            self.mode = "debugfs"
+            self.is_read_only = True
+            if reader.debugfs_root and not reader.debugfs_perm_denied:
+                self.transport_label = f"Local DebugFS/SysFS ({reader.debugfs_root}, RO)"
+            else:
+                self.transport_label = "Local SysFS (RO)"
+            if reader.debugfs_perm_denied:
+                self.last_error = "DebugFS permission denied (run with sudo for full telemetry)"
             return True
-        except OSError:
-            self.cdev_fd = -1
-            return False
+
+        self.last_error = "No local SOF audio device or DebugFS found"
+        return False
 
     def close(self):
         if self.cdev_fd >= 0:
@@ -2256,6 +2852,7 @@ class LocalCdevBackend(RemoteTcpBackend):
             except OSError:
                 pass
             self.cdev_fd = -1
+        self._sys_reader = None
         super().close()
 
     def _ioctl_win_read(
@@ -2303,6 +2900,20 @@ class LocalCdevBackend(RemoteTcpBackend):
             return None
 
     def pm_control(self, op: int, core_id: int = 0) -> Tuple[int, dict]:
+        if self._sys_reader is not None and self.cdev_fd < 0:
+            pm_active = self._sys_reader._read_pm_active()
+            fw_st = self._sys_reader._read_fw_state()
+            info = {
+                "fw_state": fw_st,
+                "dsp_power_state": 1 if pm_active else 4,
+                "pm_runtime_active": bool(pm_active),
+                "enabled_cores_mask": 1 if pm_active else 0,
+                "fd_holding_d0": False,
+                "read_only": True,
+            }
+            if op == SOF_PM_OP_QUERY:
+                return 0, info
+            return -95, info  # -EOPNOTSUPP in read-only local mode
         if self.cdev_fd < 0 and not self.connect():
             return -19, {}
         ctl = bytearray(struct.pack("<IIIIIIII", op, core_id, 0, 0, 0, 0, 0, 0))
@@ -2320,6 +2931,8 @@ class LocalCdevBackend(RemoteTcpBackend):
             return -(e.errno or 5), {}
 
     def set_perf_measurement_state(self, state_val: int) -> int:
+        if self._sys_reader is not None and self.cdev_fd < 0:
+            return -95  # Read-only mode; do not issue IPC writes
         if self.cdev_fd < 0 and not self.connect():
             return -19
         try:
@@ -2343,8 +2956,16 @@ class LocalCdevBackend(RemoteTcpBackend):
             return -(e.errno or 5)
 
     def poll_telemetry(self, force_full: bool = False, wake_dsp: bool = False) -> TelemetrySnapshot:
-        if self.cdev_fd < 0 and not self.connect():
+        if self._sys_reader is None and self.cdev_fd < 0 and not self.connect():
             return TelemetrySnapshot(timestamp=time.time(), connected=False)
+
+        if self._sys_reader is not None and self.cdev_fd < 0:
+            raw_snap = self._sys_reader.poll_raw_snapshot(self.parser)
+            if not raw_snap:
+                return TelemetrySnapshot(timestamp=time.time(), connected=False)
+            self.last_error = self._sys_reader.last_note
+            self.poll_counter += 1
+            return self.parser.parse_composite_snapshot(raw_snap, wire_len=len(raw_snap))
 
         temp_hold = False
         if wake_dsp:
@@ -2456,3 +3077,26 @@ class LocalCdevBackend(RemoteTcpBackend):
         finally:
             if temp_hold:
                 self.pm_control(SOF_PM_OP_RELEASE_HOLD)
+
+
+LocalHostBackend = LocalCdevBackend
+
+
+def build_backend_for_target(target: str, default_port: int = SOF_NET_DEFAULT_PORT) -> RemoteTcpBackend:
+    """Instantiate a LocalCdevBackend or RemoteTcpBackend from a CLI/UI target string."""
+    t = (target or "").strip()
+    if t == "local" or t.startswith("local:") or t.startswith("/"):
+        if t == "local":
+            dev_path = "auto"
+        elif t.startswith("local:"):
+            dev_path = t.split("local:", 1)[-1] or "auto"
+        else:
+            dev_path = t
+        return LocalCdevBackend(dev_path, default_port)
+
+    if ":" in t:
+        host, port_s = t.rsplit(":", 1)
+        port = int(port_s)
+    else:
+        host, port = t, default_port
+    return RemoteTcpBackend(host, port)
