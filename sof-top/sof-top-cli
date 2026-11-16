@@ -230,9 +230,26 @@ def snapshot_to_dict(
         ],
     }
     if audio_graph is not None:
-        out["audio"] = audio_graph
+        out["audio"] = _normalize_audio_graph(audio_graph)
     if probes is not None:
         out["probes"] = probes
+    return out
+
+
+def _normalize_audio_graph(audio_graph: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert tuple-keyed pcm_caps from query_audio_graph() into JSON-safe records."""
+    out = dict(audio_graph)
+    raw_caps = out.get("pcm_caps")
+    if isinstance(raw_caps, dict):
+        caps_list: List[Dict[str, Any]] = []
+        for key, cap in raw_caps.items():
+            rec = dict(cap) if isinstance(cap, dict) else {"value": cap}
+            if isinstance(key, tuple) and len(key) == 3:
+                rec["card_id"], rec["device_id"], rec["direction"] = key
+            else:
+                rec["key"] = str(key)
+            caps_list.append(rec)
+        out["pcm_caps"] = caps_list
     return out
 
 
@@ -648,9 +665,7 @@ def _resolve_target(args: argparse.Namespace) -> Tuple[Optional[str], Optional[s
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    # Avoid BrokenPipeError tracebacks when piped to `head` / `jq`
-    if hasattr(signal, "SIGPIPE"):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    # Keep SIGPIPE ignored (Python default) so BrokenPipeError triggers finally cleanup
 
     args = _parse_args(argv)
     if args.list_elements:
@@ -712,41 +727,74 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     is_ro = bool(getattr(backend, "is_read_only", False))
     held_d0 = False
+    perf_done = False
+    broken_pipe = False
     want_audio, want_probes = needs_rpc_extras(selectors)
     explicit_sections = bool(args.select) and not any(x in ("all", "full") for x in args.select)
 
+    def _emit_error(msg: str) -> int:
+        if args.format in ("json", "jsonl"):
+            print(json.dumps({"error": msg}), file=sys.stderr)
+        else:
+            print(f"ERROR: {msg}", file=sys.stderr)
+        return 1
+
+    def _emit_poll_error(err_str: str) -> int:
+        return _emit_error(f"Telemetry read failed for {target}: {err_str or 'disconnected'}")
+
+    def _try_enable_perf(pm_active: bool, fw_state: int) -> bool:
+        if perf_done or is_ro or args.no_perf or not (pm_active and fw_state == 7):
+            return perf_done
+        return backend.set_perf_measurement_state(2) == 0
+
     try:
         if (args.wake or args.hold_d0) and not is_ro:
-            op = SOF_PM_OP_BOOT_DSP if args.wake else SOF_PM_OP_WAKE_HOLD
-            backend.pm_control(op)
-            held_d0 = True
-            if not args.no_perf:
-                backend.set_perf_measurement_state(2)
-
-        def _emit_poll_error(err_str: str) -> int:
-            msg = f"Telemetry read failed for {target}: {err_str or 'disconnected'}"
-            if args.format in ("json", "jsonl"):
-                print(json.dumps({"error": msg}), file=sys.stderr)
-            else:
-                print(f"ERROR: {msg}", file=sys.stderr)
-            return 1
+            if args.wake:
+                st_pm, pm_info = backend.pm_control(SOF_PM_OP_BOOT_DSP)
+                if st_pm != 0:
+                    return _emit_error(f"PM wake/boot failed for {target} (status={st_pm})")
+                held_d0 = bool(pm_info.get("fd_holding_d0"))
+                perf_done = _try_enable_perf(
+                    bool(pm_info.get("pm_runtime_active")),
+                    int(pm_info.get("fw_state", 0)),
+                )
+            if args.hold_d0 and not held_d0:
+                st_pm, pm_info = backend.pm_control(SOF_PM_OP_WAKE_HOLD)
+                if st_pm != 0 or not pm_info.get("fd_holding_d0"):
+                    return _emit_error(
+                        f"PM hold-d0 failed for {target} (status={st_pm}, holding_d0={bool(pm_info.get('fd_holding_d0'))})"
+                    )
+                held_d0 = True
+                perf_done = _try_enable_perf(
+                    bool(pm_info.get("pm_runtime_active")),
+                    int(pm_info.get("fw_state", 0)),
+                )
 
         # Warmup poll so tick-rate deltas populate even on a single snapshot
         if count == 1 and args.warmup_ms > 0:
             s0 = backend.poll_telemetry(force_full=True, wake_dsp=(args.wake and not is_ro))
             if not s0.connected:
                 return _emit_poll_error(getattr(backend, "last_error", ""))
-            if s0.pm_runtime_active and s0.fw_state == 7 and not is_ro and not args.no_perf:
-                backend.set_perf_measurement_state(2)
+            perf_done = _try_enable_perf(bool(s0.pm_runtime_active), int(s0.fw_state))
             time.sleep(max(0.01, args.warmup_ms / 1000.0))
 
         interval_s = max(0.01, args.interval / 1000.0)
         start_wall = time.monotonic()
         sample_idx = 0
-        perf_done = False
         collected_json: List[Dict[str, Any]] = []
         stream_json_array = args.format == "json" and count != 1 and count > 0
         effective_format = "jsonl" if (args.format == "json" and count == 0) else args.format
+
+        def _write_output(text: str) -> bool:
+            nonlocal broken_pipe, stop_flag
+            try:
+                out_fh.write(text)
+                out_fh.flush()
+                return True
+            except BrokenPipeError:
+                broken_pipe = True
+                stop_flag = True
+                return False
 
         while not stop_flag:
             if count > 0 and sample_idx >= count:
@@ -760,19 +808,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 wake_dsp=((args.wake or args.hold_d0) and not is_ro),
             )
             if not snap.connected:
-                if stream_json_array and collected_json:
-                    out_fh.write(json.dumps(collected_json, indent=2) + "\n")
-                    out_fh.flush()
+                if stream_json_array and collected_json and not broken_pipe:
+                    _write_output(json.dumps(collected_json, indent=2) + "\n")
                 return _emit_poll_error(getattr(backend, "last_error", ""))
-            if (
-                not perf_done
-                and not is_ro
-                and not args.no_perf
-                and snap.pm_runtime_active
-                and snap.fw_state == 7
-            ):
-                backend.set_perf_measurement_state(2)
-                perf_done = True
+            if not perf_done and not is_ro and not args.no_perf and snap.pm_runtime_active and snap.fw_state == 7:
+                if backend.set_perf_measurement_state(2) == 0:
+                    perf_done = True
+                    settle_s = max(0.05, min(interval_s, 0.25))
+                    time.sleep(settle_s)
+                    if stop_flag:
+                        break
+                    snap = backend.poll_telemetry(
+                        force_full=True,
+                        wake_dsp=((args.wake or args.hold_d0) and not is_ro),
+                    )
+                    if not snap.connected:
+                        if stream_json_array and collected_json and not broken_pipe:
+                            _write_output(json.dumps(collected_json, indent=2) + "\n")
+                        return _emit_poll_error(getattr(backend, "last_error", ""))
 
             audio_data = None
             probe_data = None
@@ -809,23 +862,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if stream_json_array:
                 collected_json.append(filtered)
             elif effective_format == "json":
-                out_fh.write(json.dumps(filtered, indent=2) + "\n")
-                out_fh.flush()
+                if not _write_output(json.dumps(filtered, indent=2) + "\n"):
+                    break
             elif effective_format == "jsonl":
-                out_fh.write(json.dumps(filtered, separators=(",", ":")) + "\n")
-                out_fh.flush()
+                if not _write_output(json.dumps(filtered, separators=(",", ":")) + "\n"):
+                    break
             elif effective_format == "kv":
-                if sample_idx > 0 and not args.raw:
-                    out_fh.write("---\n")
-                out_fh.write(format_kv(filtered, raw=args.raw) + "\n")
-                out_fh.flush()
+                prefix = "---\n" if (sample_idx > 0 and not args.raw) else ""
+                if not _write_output(prefix + format_kv(filtered, raw=args.raw) + "\n"):
+                    break
             else:
                 if args.watch and out_fh.isatty():
-                    out_fh.write("\033[2J\033[H")
+                    prefix = "\033[2J\033[H"
                 elif sample_idx > 0:
-                    out_fh.write("\n")
-                out_fh.write(format_text(filtered, explicit_sections=explicit_sections, raw=args.raw) + "\n")
-                out_fh.flush()
+                    prefix = "\n"
+                else:
+                    prefix = ""
+                if not _write_output(prefix + format_text(filtered, explicit_sections=explicit_sections, raw=args.raw) + "\n"):
+                    break
 
             sample_idx += 1
             if count > 0 and sample_idx >= count:
@@ -837,9 +891,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if rem > 0 and not stop_flag:
                 time.sleep(rem)
 
-        if stream_json_array:
-            out_fh.write(json.dumps(collected_json, indent=2) + "\n")
-            out_fh.flush()
+        if stream_json_array and not broken_pipe:
+            _write_output(json.dumps(collected_json, indent=2) + "\n")
+    except BrokenPipeError:
+        broken_pipe = True
     finally:
         if held_d0 and not is_ro:
             try:
@@ -847,8 +902,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except Exception:
                 pass
         backend.close()
+        if broken_pipe and out_fh is sys.stdout:
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, sys.stdout.fileno())
+                os.close(devnull)
+            except Exception:
+                pass
         if close_out:
-            out_fh.close()
+            try:
+                out_fh.close()
+            except BrokenPipeError:
+                pass
     return 0
 
 

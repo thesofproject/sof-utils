@@ -2736,8 +2736,12 @@ class _LocalSysfsDebugfsReader:
             elif r_err == 13:
                 notes.append("fw_regs permission denied")
 
-            # 2. MW2 Slot 1 TEL2 (/sys/kernel/debug/sof/exception)
-            exc_data, exc_err = _read_bin_file(self._dbg("exception"), 4096)
+            # 2. MW2 Slot 1 TEL2 (/sys/kernel/debug/sof/exception) - only valid once BOOT_COMPLETE
+            exc_data, exc_err = (
+                _read_bin_file(self._dbg("exception"), 4096)
+                if fw_state == 7
+                else (None, 0)
+            )
             if exc_data and len(exc_data) >= 256:
                 bias = sof_tel2_slot_bias(exc_data)
                 first_u32 = struct.unpack_from("<I", exc_data, 0)[0]
