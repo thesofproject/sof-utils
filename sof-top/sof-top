@@ -140,8 +140,6 @@ def _load_remote_history(limit: int = 20) -> List[str]:
 
 def _record_remote_history(target: str, limit: int = 20) -> List[str]:
     s = (target or "").strip()
-    if s.endswith(":9998"):
-        s = s[:-5].strip()
     if not s or s == "local" or s.startswith("local:") or s.startswith("/"):
         return _load_remote_history(limit)
     cur = _load_remote_history(limit)
@@ -308,9 +306,7 @@ class SofTopUserWindow(Gtk.ApplicationWindow):
                 self.target_entry.set_text(self.remote_history[0])
         else:
             self.mode_dropdown.set_selected(0 if local_avail else 1)
-            if self.args.local and self.args.local != "auto":
-                self.target_entry.set_text(self.args.local)
-            elif self.remote_history:
+            if self.remote_history:
                 self.target_entry.set_text(self.remote_history[0])
         self._suppress_mode_signal = False
         self._refresh_remote_history_popover()
