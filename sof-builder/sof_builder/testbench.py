@@ -31,7 +31,11 @@ gi.require_version("Graphene", "1.0")
 gi.require_version("Pango", "1.0")
 from gi.repository import Gdk, GLib, Graphene, Gsk, Gtk, Pango
 
-from .model import debug_log_command, debug_log_line
+from .model import (
+    debug_log_command,
+    debug_log_line,
+    resolve_sof_and_workspace_roots,
+)
 from .tplg_ipc4 import (
     SND_SOC_TPLG_TYPE_BYTES,
     SND_SOC_TPLG_TYPE_ENUM,
@@ -2611,18 +2615,20 @@ class TestbenchRunner:
 
     def _find_testbench_bin(self) -> str:
         sof_utils_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        sof_root = os.path.abspath(os.path.join(self.topology2_root, "..", "..", ".."))
-        workspace_root = os.path.abspath(os.path.join(sof_root, ".."))
+        sof_root, workspace_root = resolve_sof_and_workspace_roots(self.topology2_root)
         candidates = [
             os.environ.get("SOF_TESTBENCH_BIN", ""),
             os.path.join(sof_utils_root, "sof-testbench", "build", "sof-testbench4"),
             os.path.join(sof_utils_root, "build", "sof-testbench", "sof-testbench4"),
-            os.path.join(sof_root, "tools", "testbench", "build_testbench", "sof-testbench4"),
-            os.path.join(sof_root, "tools", "testbench", "build_testbench", "install", "bin", "sof-testbench4"),
-            os.path.join(sof_root, "build_testbench", "sof-testbench4"),
             os.path.join(workspace_root, "tools", "bin", "sof-testbench4"),
             shutil.which("sof-testbench4") or "",
         ]
+        if sof_root:
+            candidates.extend([
+                os.path.join(sof_root, "tools", "testbench", "build_testbench", "sof-testbench4"),
+                os.path.join(sof_root, "tools", "testbench", "build_testbench", "install", "bin", "sof-testbench4"),
+                os.path.join(sof_root, "build_testbench", "sof-testbench4"),
+            ])
         for c in candidates:
             if c and os.path.isfile(c) and os.access(c, os.X_OK):
                 return c

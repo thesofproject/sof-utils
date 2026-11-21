@@ -1,8 +1,18 @@
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# West manifest for sof-utils.
-# Aligns the SOF firmware repository (src/audio, src/ipc, src/math) version
-# with sof-utils (sof-testbench4, sof-tb-ctl, tplg_parser, sof-builder).
+# West manifest for standalone sof-utils development.
+# Aligns the SOF firmware repository (src/audio, src/ipc, src/math) and
+# sof-topologies (topology2) with sof-utils (sof-testbench4, sof-tb-ctl,
+# sof-tplg-parser, sof-builder).
+#
+# Usage & update conventions:
+# - Standalone sof-utils workspace:
+#     west init -l sof-utils && west update
+#   Update `self` (sof-utils) with Git, then sync dependencies with West:
+#     git -C sof-utils pull && west update
+# - Full SOF workspace (`west init -l sof`):
+#     `sof/west.yml` is the top-level manifest and pins `sof-utils` directly;
+#     this file is not imported there, avoiding any circular dependency.
 
 manifest:
   defaults:
@@ -17,10 +27,16 @@ manifest:
       repo-path: sof
       path: sof
       revision: main
+      # Import only `zephyr` so `sof/west.yml` does not import `sof-utils` back.
       import:
         file: west.yml
         name-allowlist:
           - zephyr
+
+    - name: sof-topologies
+      repo-path: sof-topologies
+      path: sof-topologies
+      revision: main
 
   self:
     path: sof-utils

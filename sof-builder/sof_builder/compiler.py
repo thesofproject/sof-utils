@@ -10,7 +10,12 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .model import GraphViewModel, debug_log_command, debug_log_line
+from .model import (
+    GraphViewModel,
+    debug_log_command,
+    debug_log_line,
+    resolve_sof_and_workspace_roots,
+)
 from .serializer import generate_compilable_conf
 
 
@@ -409,8 +414,7 @@ class TopologyCompiler:
 
     def _find_alsatplg(self) -> str:
         # Check ALSATPLG env var, workspace tools/bin/alsatplg, then PATH
-        sof_root = os.path.abspath(os.path.join(self.topology2_root, "..", "..", ".."))
-        workspace_root = os.path.abspath(os.path.join(sof_root, ".."))
+        _, workspace_root = resolve_sof_and_workspace_roots(self.topology2_root)
         candidates = [
             os.environ.get("ALSATPLG", ""),
             os.path.join(workspace_root, "tools", "bin", "alsatplg"),
@@ -428,11 +432,18 @@ class TopologyCompiler:
             return abi_path
 
         get_abi = os.path.join(self.topology2_root, "get_abi.sh")
-        sof_root = os.path.abspath(os.path.join(self.topology2_root, "..", "..", ".."))
-        if os.path.isfile(get_abi) and os.path.isdir(os.path.join(sof_root, "src")):
+        sof_root, _ = resolve_sof_and_workspace_roots(self.topology2_root)
+        tplg_repo_root = os.path.abspath(os.path.join(self.topology2_root, ".."))
+        abi_source = ""
+        if sof_root and os.path.isdir(os.path.join(sof_root, "src")):
+            abi_source = sof_root
+        elif os.path.isfile(os.path.join(tplg_repo_root, "include", "kernel", "abi.h")):
+            abi_source = tplg_repo_root
+
+        if os.path.isfile(get_abi) and abi_source:
             try:
                 res = subprocess.run(
-                    [get_abi, sof_root, "ipc4"],
+                    [get_abi, abi_source, "ipc4"],
                     capture_output=True,
                     text=True,
                     check=True,

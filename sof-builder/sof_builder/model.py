@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import datetime
 import os
+import subprocess
 import sys
 import threading
 import traceback
@@ -535,3 +536,133 @@ class UndoRedoManager:
         if self.on_history_changed:
             self.on_history_changed()
         return (next_entry, action_desc)
+
+
+def _run_west_cmd(args: List[str], cwd: Optional[str] = None) -> str:
+    """Run a west query command quietly and return stripped stdout, or ''."""
+    search_cwd = cwd if (cwd and os.path.isdir(cwd)) else os.path.dirname(os.path.abspath(__file__))
+    try:
+        res = subprocess.run(
+            ["west", *args],
+            cwd=search_cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=3,
+        )
+        return res.stdout.strip()
+    except Exception:
+        return ""
+
+
+def west_project_path(project: str, cwd: Optional[str] = None) -> str:
+    """Return the absolute path of a west project, or '' if unavailable."""
+    out = _run_west_cmd(["list", "-f", "{abspath}", project], cwd=cwd)
+    return os.path.abspath(out) if out and os.path.isdir(out) else ""
+
+
+def west_topdir(cwd: Optional[str] = None) -> str:
+    """Return the west workspace top directory, or '' if not inside one."""
+    out = _run_west_cmd(["topdir"], cwd=cwd)
+    return os.path.abspath(out) if out and os.path.isdir(out) else ""
+
+
+def resolve_sof_and_workspace_roots(topology2_root: str = "") -> Tuple[str, str]:
+    """Resolve `(sof_root, workspace_root)` across west, standalone sof-topologies, and legacy sof layouts."""
+    sof_utils_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    sof_root = ""
+    for env_var in ("SOF_ROOT", "SOF_SRC_DIR"):
+        cand = os.environ.get(env_var, "").strip()
+        if cand and os.path.isdir(os.path.join(cand, "src")):
+            sof_root = os.path.abspath(cand)
+            break
+
+    query_cwd = topology2_root if (topology2_root and os.path.isdir(topology2_root)) else sof_utils_root
+    if not sof_root:
+        sof_root = west_project_path("sof", cwd=query_cwd) or west_project_path("sof", cwd=sof_utils_root)
+
+    workspace_root = west_topdir(cwd=query_cwd) or west_topdir(cwd=sof_utils_root)
+
+    if not sof_root and topology2_root:
+        norm_t2 = os.path.abspath(topology2_root)
+        # Legacy in-tree layout: <sof_root>/tools/topology/topology2
+        legacy_sof = os.path.abspath(os.path.join(norm_t2, "..", "..", ".."))
+        if os.path.isdir(os.path.join(legacy_sof, "src")):
+            sof_root = legacy_sof
+        else:
+            # Standalone sof-topologies layout: <workspace_root>/sof-topologies/topology2
+            tplg_repo_parent = os.path.abspath(os.path.join(norm_t2, "..", ".."))
+            sib_sof = os.path.join(tplg_repo_parent, "sof")
+            if os.path.isdir(os.path.join(sib_sof, "src")):
+                sof_root = sib_sof
+            if not workspace_root:
+                workspace_root = tplg_repo_parent
+
+    if not sof_root:
+        sib_sof = os.path.abspath(os.path.join(sof_utils_root, "..", "sof"))
+        if os.path.isdir(os.path.join(sib_sof, "src")):
+            sof_root = sib_sof
+
+    if not workspace_root:
+        if sof_root:
+            workspace_root = os.path.abspath(os.path.join(sof_root, ".."))
+        else:
+            workspace_root = os.path.abspath(os.path.join(sof_utils_root, ".."))
+
+    return (sof_root, workspace_root)
+
+
+def discover_topology2_dir(initial_dir: Optional[str] = None, saved_dir: str = "") -> str:
+    """Locate a topology2 directory across CLI arg, env vars, west workspace, and sibling repos."""
+    if initial_dir:
+        abs_init = os.path.abspath(initial_dir)
+        if os.path.isdir(abs_init):
+            return abs_init
+
+    candidates: List[str] = []
+    env_tplg2 = os.environ.get("SOF_TOPOLOGY2_DIR", "").strip()
+    if env_tplg2:
+        candidates.append(os.path.abspath(env_tplg2))
+    env_tplg_repo = os.environ.get("SOF_TOPOLOGIES_DIR", "").strip()
+    if env_tplg_repo:
+        candidates.append(os.path.abspath(os.path.join(env_tplg_repo, "topology2")))
+    env_sof = os.environ.get("SOF_ROOT", "").strip()
+    if env_sof:
+        candidates.append(os.path.abspath(os.path.join(env_sof, "tools", "topology", "topology2")))
+    if saved_dir:
+        candidates.append(saved_dir)
+
+    sof_utils_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    for cwd_probe in (os.getcwd(), sof_utils_root):
+        west_tplg = west_project_path("sof-topologies", cwd=cwd_probe)
+        if west_tplg:
+            candidates.append(os.path.join(west_tplg, "topology2"))
+        west_sof = west_project_path("sof", cwd=cwd_probe)
+        if west_sof:
+            candidates.append(os.path.join(west_sof, "tools", "topology", "topology2"))
+
+    # Check current working directory and ancestors
+    cur = os.path.abspath(os.getcwd())
+    for _ in range(5):
+        candidates.append(os.path.join(cur, "topology2"))
+        candidates.append(os.path.join(cur, "tools", "topology", "topology2"))
+        if os.path.basename(cur) == "topology2" and os.path.isdir(os.path.join(cur, "include")):
+            candidates.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    # Check sibling checkouts relative to sof-utils root
+    pkg_root = os.path.abspath(os.path.join(sof_utils_root, ".."))
+    for sib in ("sof-topologies", "sof-topology"):
+        candidates.append(os.path.join(pkg_root, sib, "topology2"))
+    candidates.append(os.path.join(pkg_root, "sof", "tools", "topology", "topology2"))
+
+    for cand in candidates:
+        if cand and os.path.isdir(cand) and os.path.isdir(os.path.join(cand, "include")):
+            return cand
+    for cand in candidates:
+        if cand and os.path.isdir(cand):
+            return cand
+    return ""
