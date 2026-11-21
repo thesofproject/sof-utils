@@ -143,7 +143,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "initial_dir",
         nargs="?",
         default=None,
-        help="Optional path to tools/topology/topology2 directory (or set SOF_TOPOLOGY2_DIR / SOF_ROOT)",
+        help="Optional path to sof-topologies/topology2 directory (or set SOF_TOPOLOGY2_DIR / SOF_ROOT)",
     )
     parser.add_argument(
         "-d",

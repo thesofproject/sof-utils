@@ -125,10 +125,11 @@ usage: sof-builder [-h] [-d] [--debug-file FILE] [initial_dir]
 
 | Argument / Environment Variable | Description |
 | :--- | :--- |
-| `initial_dir` / `SOF_TOPOLOGY2_DIR` | Path to the SOF `tools/topology/topology2` directory to load on startup. |
-| `SOF_ROOT` | Path to the root of an SOF repository checkout (used to locate `tools/topology/topology2`, `sof_versions.h`, and `sof-testbench4`). |
+| `initial_dir` / `SOF_TOPOLOGY2_DIR` | Path to the `sof-topologies/topology2` (or legacy `sof/tools/topology/topology2`) directory to load on startup. |
+| `SOF_TOPOLOGIES_DIR` | Path to a `sof-topologies` checkout (auto-detected via `west list sof-topologies` inside a west workspace). |
+| `SOF_ROOT` | Path to the root of an SOF repository checkout (auto-detected via `west list sof` inside a west workspace). |
 | `ALSATPLG` | Optional explicit path to the `alsatplg` binary (defaults to `PATH` or workspace build). |
-| `SOF_TESTBENCH_BIN` | Optional explicit path to the `sof-testbench4` binary (defaults to `<SOF_ROOT>/tools/testbench/build_testbench/sof-testbench4` or `PATH`). |
+| `SOF_TESTBENCH_BIN` | Optional explicit path to the `sof-testbench4` binary (defaults to `sof-testbench/build/sof-testbench4` or `PATH`). |
 | `-d`, `--debug` | Enable action & command debug logging to `sof-builder-debug.log`. |
 | `--debug-file FILE` | Write debug log output to `FILE`. |
 

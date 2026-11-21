@@ -39,6 +39,8 @@ from .model import (
     debug_log_action,
     debug_log_command,
     debug_log_line,
+    discover_topology2_dir,
+    resolve_sof_and_workspace_roots,
 )
 from .parser import Topology2Workspace
 from .right_inspector import RightAttributeInspector
@@ -178,44 +180,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self.load_topology2_directory(default_dir)
 
     def _discover_default_topology2_dir(self, initial_dir: Optional[str] = None) -> str:
-        """Locate a valid tools/topology/topology2 workspace directory without hardcoded user paths."""
-        if initial_dir:
-            abs_init = os.path.abspath(initial_dir)
-            if os.path.isdir(abs_init):
-                return abs_init
-        candidates: List[str] = []
-        env_tplg2 = os.environ.get("SOF_TOPOLOGY2_DIR", "").strip()
-        if env_tplg2:
-            candidates.append(os.path.abspath(env_tplg2))
-        env_sof = os.environ.get("SOF_ROOT", "").strip()
-        if env_sof:
-            candidates.append(os.path.abspath(os.path.join(env_sof, "tools", "topology", "topology2")))
-        if self._saved_topology2_dir:
-            candidates.append(self._saved_topology2_dir)
-
-        # Check current working directory and ancestors for an SOF checkout
-        cur = os.path.abspath(os.getcwd())
-        for _ in range(5):
-            candidates.append(os.path.join(cur, "tools", "topology", "topology2"))
-            if os.path.basename(cur) == "topology2" and os.path.isdir(os.path.join(cur, "include")):
-                candidates.append(cur)
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
-
-        # Also check sibling SOF checkouts relative to the repository root
-        pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-        for sib in ("sof", "sof-arl/sof-arl", "sof-arl", "sof-ptl", "sof-tgl"):
-            candidates.append(os.path.join(pkg_root, sib, "tools", "topology", "topology2"))
-
-        for cand in candidates:
-            if cand and os.path.isdir(cand) and os.path.isdir(os.path.join(cand, "include")):
-                return cand
-        for cand in candidates:
-            if cand and os.path.isdir(cand):
-                return cand
-        return ""
+        """Locate a valid topology2 workspace directory via west, env vars, or sibling checkouts."""
+        return discover_topology2_dir(initial_dir=initial_dir, saved_dir=self._saved_topology2_dir)
 
     @property
     def canvas(self) -> TopologyGraphCanvas:
@@ -546,17 +512,20 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             if (self.workspace and self.workspace.root_dir)
             else self._discover_default_topology2_dir()
         )
-        sof_root = (
-            os.environ.get("SOF_ROOT", "").strip()
-            or (os.path.abspath(os.path.join(tplg2_root, "..", "..", "..")) if tplg2_root else "")
-        )
+        sof_root, _ = resolve_sof_and_workspace_roots(tplg2_root)
+        sof_utils_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
         # 1. SOF Version
         sof_ver_parts: List[str] = []
         sof_ver_h_candidates = [
-            os.path.join(sof_root, "tools", "testbench", "build_testbench", "sof_ep", "build", "generated", "include", "sof_versions.h"),
-            os.path.join(sof_root, "build_testbench", "sof_ep", "build", "generated", "include", "sof_versions.h"),
+            os.path.join(sof_utils_root, "sof-testbench", "build", "sof_lib", "generated", "include", "sof_versions.h"),
+            os.path.join(sof_utils_root, "build", "sof-testbench", "sof_lib", "generated", "include", "sof_versions.h"),
         ]
+        if sof_root:
+            sof_ver_h_candidates.extend([
+                os.path.join(sof_root, "tools", "testbench", "build_testbench", "sof_ep", "build", "generated", "include", "sof_versions.h"),
+                os.path.join(sof_root, "build_testbench", "sof_ep", "build", "generated", "include", "sof_versions.h"),
+            ])
         for vh_path in sof_ver_h_candidates:
             if os.path.isfile(vh_path):
                 try:
@@ -5004,7 +4973,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _on_open_dir_clicked(self, _btn: Gtk.Button) -> None:
         dialog = Gtk.FileDialog.new()
-        dialog.set_title("Select tools/topology/topology2 Directory")
+        dialog.set_title("Select topology2 Directory")
         dialog.select_folder(self, None, self._on_folder_selected)
 
     def _on_folder_selected(self, dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:

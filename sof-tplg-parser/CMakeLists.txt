@@ -21,11 +21,9 @@ if(NOT SOF_SRC_DIR)
 			set(SOF_SRC_DIR "${_west_sof_dir}")
 		else()
 			foreach(_cand
-				"${CMAKE_CURRENT_SOURCE_DIR}/../../sof-dragon-fly/sof-testbench-upstream"
-				"${CMAKE_CURRENT_SOURCE_DIR}/../../sof/sof"
 				"${CMAKE_CURRENT_SOURCE_DIR}/../../sof"
+				"${CMAKE_CURRENT_SOURCE_DIR}/../../sof/sof"
 				"${CMAKE_CURRENT_SOURCE_DIR}/../sof"
-				"${CMAKE_CURRENT_SOURCE_DIR}/../../sof-dragon-fly/sof-arl"
 			)
 				if(EXISTS "${_cand}/CMakeLists.txt")
 					set(SOF_SRC_DIR "${_cand}")

@@ -49,12 +49,8 @@ ifeq ($(strip $(SOF_SRC_DIR)),)
 endif
 ifeq ($(strip $(SOF_SRC_DIR)),)
   SOF_CANDIDATES := \
-    $(WORK_DIR)/sof-dragon-fly/sof-testbench-upstream \
-    $(WORK_DIR)/sof/sof \
     $(WORK_DIR)/sof \
-    $(WORK_DIR)/sof-dragon-fly/sof-arl \
-    $(WORK_DIR)/sof-arl/sof-testbench-upstream \
-    $(WORK_DIR)/sof-arl/sof
+    $(WORK_DIR)/sof/sof
   SOF_SRC_DIR := $(firstword $(foreach d,$(SOF_CANDIDATES),$(if $(wildcard $(d)/Kconfig),$(abspath $(d)))))
 endif
 

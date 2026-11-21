@@ -21,19 +21,29 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Locate SOF repository root for topology2 build outputs
+# Locate SOF repository root for firmware/module sources
 if [[ -n "${SOF_SRC_DIR:-}" && -d "${SOF_SRC_DIR}" ]]; then
 	SOF_TOP="$(cd "${SOF_SRC_DIR}" && pwd)"
 elif [[ -n "${SOF_ROOT:-}" && -d "${SOF_ROOT}" ]]; then
 	SOF_TOP="$(cd "${SOF_ROOT}" && pwd)"
 elif command -v west >/dev/null 2>&1 && _west_sof="$(cd "${SCRIPT_DIR}" && west list -f "{abspath}" sof 2>/dev/null)" && [[ -d "${_west_sof}" ]]; then
 	SOF_TOP="${_west_sof}"
-elif [[ -d "${SCRIPT_DIR}/../../sof/tools" ]]; then
+elif [[ -d "${SCRIPT_DIR}/../../sof/src" ]]; then
 	SOF_TOP="$(cd "${SCRIPT_DIR}/../../sof" && pwd)"
-elif [[ -d "${SCRIPT_DIR}/../../sof-arl/sof-testbench-upstream/tools" ]]; then
-	SOF_TOP="$(cd "${SCRIPT_DIR}/../../sof-arl/sof-testbench-upstream" && pwd)"
 else
 	SOF_TOP="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+fi
+
+# Locate sof-topologies checkout if available
+TPLG_REPO=""
+if [[ -n "${SOF_TOPOLOGIES_DIR:-}" && -d "${SOF_TOPOLOGIES_DIR}" ]]; then
+	TPLG_REPO="$(cd "${SOF_TOPOLOGIES_DIR}" && pwd)"
+elif command -v west >/dev/null 2>&1 && _west_tplg="$(cd "${SCRIPT_DIR}" && west list -f "{abspath}" sof-topologies 2>/dev/null)" && [[ -d "${_west_tplg}" ]]; then
+	TPLG_REPO="${_west_tplg}"
+elif [[ -d "${SCRIPT_DIR}/../../sof-topologies/topology2" ]]; then
+	TPLG_REPO="$(cd "${SCRIPT_DIR}/../../sof-topologies" && pwd)"
+elif [[ -d "${SCRIPT_DIR}/../../sof-topology/topology2" ]]; then
+	TPLG_REPO="$(cd "${SCRIPT_DIR}/../../sof-topology" && pwd)"
 fi
 
 # Locate sof-testbench4 binary
@@ -78,17 +88,24 @@ fi
 
 if [[ -z "${TPLG_DIR:-}" ]]; then
 	for _tplg_cand in \
+		"${TPLG_REPO:+${TPLG_REPO}/build/topology2}" \
 		"${SCRIPT_DIR}/build/topology/topology2" \
 		"${SCRIPT_DIR}/../build/sof-testbench/topology/topology2" \
 		"${SOF_TOP}/tools/build_tools/topology/topology2" \
-		"${SOF_TOP}/../sof-arl/tools/build_tools/topology/topology2" \
-		"${SOF_TOP}/../sof/tools/build_tools/topology/topology2"; do
-		if [[ -d "${_tplg_cand}/development" ]]; then
+		"${SOF_TOP}/../sof-topologies/build/topology2" \
+		"${SOF_TOP}/../sof-topology/build/topology2"; do
+		if [[ -n "${_tplg_cand}" && -d "${_tplg_cand}/development" ]]; then
 			TPLG_DIR="$(cd "${_tplg_cand}" && pwd)"
 			break
 		fi
 	done
-	TPLG_DIR="${TPLG_DIR:-${SOF_TOP}/tools/build_tools/topology/topology2}"
+	if [[ -z "${TPLG_DIR:-}" ]]; then
+		if [[ -n "${TPLG_REPO}" ]]; then
+			TPLG_DIR="${TPLG_REPO}/build/topology2"
+		else
+			TPLG_DIR="${SOF_TOP}/tools/build_tools/topology/topology2"
+		fi
+	fi
 fi
 DEV_TPLG="${TPLG_DIR}/development"
 PROD_TPLG="${TPLG_DIR}/production"
