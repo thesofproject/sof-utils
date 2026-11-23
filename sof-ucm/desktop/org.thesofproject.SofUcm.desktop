@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SOF UCM
+GenericName=SOF End-to-End Pipeline Visualizer & ALSA UCM2 Editor
+Comment=Visualize PCM-to-Hardware Audio Pipelines and Edit/Create ALSA UCM2 Profiles
+Exec=sof-ucm
+Icon=audio-card
+Terminal=false
+Categories=Development;AudioVideo;Audio;
+Keywords=SOF;ALSA;UCM;UCM2;DAPM;Topology;DSP;GTK4;
+StartupWMClass=org.thesofproject.SofUcm

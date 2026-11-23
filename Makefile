@@ -2,6 +2,7 @@
 #
 # Top-level Makefile for sof-utils:
 #   - sof-builder       : GTK4 Topology2 Visual Graph Editor & Testbench Studio
+#   - sof-ucm           : GTK4 End-to-End Pipeline Visualizer & ALSA UCM2 Editor
 #   - sof-top           : GTK4 Live DSP Resource, Memory (SRAM + DRAM) & Task Monitor
 #   - sof-remote-server : C TCP Telemetry & Control Daemon (sof_remote_server) + CLI (sof-remote)
 #   - sof-testbench     : Multi-Core LL/DP Host Simulator (sof-testbench4) + CLI (sof-tb-ctl)
@@ -60,14 +61,14 @@ DEB_STAGE    := $(BUILD_DIR)/deb-stage/$(PACKAGE)_$(VERSION)-$(RELEASE)_$(DEB_AR
 DEB_FILE     := $(DIST_DIR)/$(PACKAGE)_$(VERSION)-$(RELEASE)_$(DEB_ARCH).deb
 RPM_TOPDIR   := $(abspath $(BUILD_DIR)/rpmbuild)
 
-.PHONY: all build remote-server builder top testbench \
+.PHONY: all build remote-server builder ucm top testbench \
         android android-push \
         install uninstall check test ctest \
         deb rpm package packages clean distclean help
 
 all: build
 
-build: remote-server builder top testbench
+build: remote-server builder ucm top testbench
 
 remote-server:
 	$(MAKE) -C sof-remote-server WORK_DIR="$(WORK_DIR)" all
@@ -80,6 +81,9 @@ android-push:
 
 builder:
 	$(MAKE) -C sof-builder PYTHON="$(PYTHON)" all
+
+ucm:
+	$(MAKE) -C sof-ucm PYTHON="$(PYTHON)" all
 
 top:
 	$(MAKE) -C sof-top PYTHON="$(PYTHON)" all
@@ -107,6 +111,7 @@ endif
 install: build
 	$(MAKE) -C sof-remote-server DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" WORK_DIR="$(WORK_DIR)" install
 	$(MAKE) -C sof-builder DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" install
+	$(MAKE) -C sof-ucm DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" install
 	$(MAKE) -C sof-top DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" install
 	$(INSTALL) -d "$(DESTDIR)$(DOCDIR)"
 	$(INSTALL) -m 0644 README.md LICENSE "$(DESTDIR)$(DOCDIR)/"
@@ -132,6 +137,7 @@ install: build
 uninstall:
 	$(MAKE) -C sof-remote-server DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" uninstall
 	$(MAKE) -C sof-builder DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" uninstall
+	$(MAKE) -C sof-ucm DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" uninstall
 	$(MAKE) -C sof-top DESTDIR="$(DESTDIR)" PREFIX="$(PREFIX)" BINDIR="$(BINDIR)" DATADIR="$(DATADIR)" uninstall
 	rm -f "$(DESTDIR)$(BINDIR)/sof-testbench4" \
 	      "$(DESTDIR)$(BINDIR)/sof-testbench3" \
@@ -142,6 +148,7 @@ uninstall:
 
 check:
 	$(MAKE) -C sof-builder PYTHON="$(PYTHON)" check
+	$(MAKE) -C sof-ucm PYTHON="$(PYTHON)" check
 	$(MAKE) -C sof-top PYTHON="$(PYTHON)" check
 
 test: check
@@ -172,6 +179,7 @@ deb: build
 		echo " Developer utilities, visual GTK4 applications, and host/DUT tools for the"; \
 		echo " Sound Open Firmware (SOF) ecosystem:"; \
 		echo "  * sof-builder: GTK4 Topology2 Visual Graph Editor, IPC4 Compiler & Testbench Studio"; \
+		echo "  * sof-ucm: GTK4 End-to-End Audio Pipeline Visualizer & ALSA UCM2 Editor"; \
 		echo "  * sof-top: GTK4 Live DSP Resource, Memory (SRAM + DRAM) & Task Monitor"; \
 		echo "  * sof_remote_server & sof-remote: TCP Telemetry & Control Daemon and CLI for DUTs"; \
 		echo "  * sof-testbench4 & sof-tb-ctl: Multi-core LL/DP Host DSP Simulator & Control CLI"; \
@@ -226,6 +234,7 @@ package packages: deb rpm
 clean:
 	$(MAKE) -C sof-remote-server clean
 	$(MAKE) -C sof-builder clean
+	$(MAKE) -C sof-ucm clean
 	$(MAKE) -C sof-top clean
 	rm -rf "$(BUILD_DIR)"
 

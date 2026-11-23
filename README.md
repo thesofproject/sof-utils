@@ -11,6 +11,7 @@ Developer utilities, visual tools, and host applications for the [Sound Open Fir
 | **[`sof-top`](sof-top/sof-top)** | [`sof-top/`](sof-top/) | GTK4 Live DSP Resource Monitor — Moving Core Utilization Graph, Moving Memory Utilization Graph (HPSRAM, LPSRAM, DRAM L3/IMR, Heaps), and Unified DSP Task List |
 | **[`sof-remote-server`](sof-remote-server/)** | [`sof-remote-server/`](sof-remote-server/) | Lightweight C TCP Telemetry & Control Daemon (Port `9998`) for DUTs via `/dev/sof-dsp0` or direct PCIe BAR4 MMIO + DebugFS/SysFS fallback |
 | **[`sof-builder`](sof-builder/)** | [`sof-builder/`](sof-builder/) | GTK4 Topology2 Visual Graph Editor, IPC4 `.tplg` Compiler & Real-Time `sof-testbench4` Simulation / Telemetry Studio |
+| **[`sof-ucm`](sof-ucm/sof-ucm)** | [`sof-ucm/`](sof-ucm/) | GTK4 End-to-End Audio Pipeline Visualizer (PCM → DSP → Codec → HW Endpoints) & ALSA UCM2 Editor/Generator (Local + SSH) |
 | **[`sof-testbench`](sof-testbench/)** | [`sof-testbench/`](sof-testbench/) | Multi-Core LL/DP `sof-testbench4` Simulator, `sof-tb-ctl` TCP Control CLI, Host Platform Runtime (`platform/library`), and 70-Test Suite |
 | **[`sof-tplg-parser`](sof-tplg-parser/)** | [`sof-tplg-parser/`](sof-tplg-parser/) | ALSA Topology (`.tplg`) IPC3/IPC4 Parser Library (`libsof_tplg_parser.a`) |
 

@@ -24,6 +24,7 @@ Requires:       alsa-utils
 Developer utilities, visual GTK4 applications, and host/DUT tools for the
 Sound Open Firmware (SOF) ecosystem:
 - sof-builder: GTK4 Topology2 Visual Graph Editor, IPC4 Compiler & Testbench Studio
+- sof-ucm: GTK4 End-to-End Audio Pipeline Visualizer & ALSA UCM2 Editor
 - sof-top: GTK4 Live DSP Resource, Memory (SRAM + DRAM) & Task Monitor
 - sof-remote-server & sof-remote: TCP Telemetry & Control Daemon and CLI for DUTs
 - sof-testbench4 & sof-tb-ctl: Multi-core LL/DP Host DSP Simulator & Control CLI
@@ -48,6 +49,7 @@ rm -rf %{buildroot}
 %files
 %license LICENSE
 %{_bindir}/sof-builder
+%{_bindir}/sof-ucm
 %{_bindir}/sof-top
 %{_bindir}/sof-top-cli
 %{_bindir}/sof_remote_server
@@ -55,6 +57,7 @@ rm -rf %{buildroot}
 %{_bindir}/sof-remote
 %{_datadir}/sof-utils/
 %{_datadir}/applications/org.thesofproject.SofBuilder.desktop
+%{_datadir}/applications/org.thesofproject.SofUcm.desktop
 %{_datadir}/applications/org.thesofproject.SofTop.desktop
 %{_datadir}/doc/sof-utils/
 %if 0%{?with_testbench}
