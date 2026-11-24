@@ -6,6 +6,7 @@ import copy
 import os
 import posixpath
 import shlex
+import subprocess
 import tempfile
 import threading
 from typing import Dict, List, Optional, Set, Tuple
@@ -13,8 +14,9 @@ from typing import Dict, List, Optional, Set, Tuple
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 gi.require_version("Pango", "1.0")
-from gi.repository import GLib, Gtk, Pango
+from gi.repository import Gdk, GLib, Gtk, Pango
 
 from .discovery import (
     LocalTransport,
@@ -91,13 +93,62 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
         self._suppress_card_combo: bool = False
         self._text_editors: Dict[str, UcmTextEditor] = {}
         self.undo_mgr = UndoRedoManager()
+        self._last_profile_snapshot: Optional[UcmProfile] = None
         self._last_layout_size: Tuple[int, int] = (0, 0)
         self._applying_paned_layout: bool = False
         self._user_paned_adjusted: bool = False
 
         self._build_ui()
+        key_ctrl = Gtk.EventControllerKey.new()
+        key_ctrl.connect("key-pressed", self._on_window_key_pressed)
+        self.add_controller(key_ctrl)
         self.maximize()
         GLib.idle_add(self._initial_load)
+
+    def _on_window_key_pressed(
+        self, _ctrl: Gtk.EventControllerKey, keyval: int, _kc: int, state: Gdk.ModifierType
+    ) -> bool:
+        focus = self.get_focus()
+        if isinstance(focus, (Gtk.TextView, Gtk.Entry)):
+            return False
+        if not (state & Gdk.ModifierType.CONTROL_MASK):
+            return False
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+            return self._redo_ucm() if shift else self._undo_ucm()
+        if keyval in (Gdk.KEY_y, Gdk.KEY_Y):
+            return self._redo_ucm()
+        return False
+
+    def _apply_restored_profile(self, label: str, restored: UcmProfile) -> None:
+        self.profile = restored
+        self._last_profile_snapshot = copy.deepcopy(restored)
+        if self.snap and self.vm:
+            validate_ucm_profile(self.profile, self.snap, self.vm)
+        self.left_panel.set_data(self.snap, self.vm, self.profile)
+        self._rebuild_text_editor_tabs()
+        self._apply_ucm_overlay_and_redraw(auto_fit=False)
+        self.append_log(f"[UCM] {label}")
+
+    def _undo_ucm(self) -> bool:
+        if not self.profile:
+            return False
+        res = self.undo_mgr.undo(copy.deepcopy(self.profile))
+        if not res:
+            return False
+        label, prev = res
+        self._apply_restored_profile(f"Undo: {label}", prev)
+        return True
+
+    def _redo_ucm(self) -> bool:
+        if not self.profile:
+            return False
+        res = self.undo_mgr.redo(copy.deepcopy(self.profile))
+        if not res:
+            return False
+        label, nxt = res
+        self._apply_restored_profile(f"Redo: {label}", nxt)
+        return True
 
     def _build_ui(self) -> None:
         root_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -491,6 +542,8 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
         self.snap = snap
         self.vm = vm
         self.profile = profile
+        self.undo_mgr.clear()
+        self._last_profile_snapshot = copy.deepcopy(profile) if profile else None
 
         tplg_txt = snap.card.tplg_path if (snap.card and snap.card.tplg_path) else "(none detected)"
         dapm_txt = f"DAPM: {len(snap.dapm_widgets)} widgets" if snap.dapm_available else "DAPM: synthesized"
@@ -587,7 +640,10 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
                     if vrel in rebuilt.raw_files:
                         vast = parse_ucm_ast(rebuilt.raw_files[vrel])
                         _apply_ucm_items(vast, rebuilt, ctx, self.snap, None, vrel, cur_verb=verb)
+                if self._last_profile_snapshot is not None:
+                    self.undo_mgr.push("Edit UCM2 text", self._last_profile_snapshot)
                 self.profile = rebuilt
+                self._last_profile_snapshot = copy.deepcopy(rebuilt)
                 if self.vm:
                     validate_ucm_profile(self.profile, self.snap, self.vm)
                 self.left_panel.set_data(self.snap, self.vm, self.profile)
@@ -623,6 +679,7 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
         self.vm.has_active_trace = True
         for e in self.vm.edges:
             e.is_ucm_highlighted = e.id in vis_edges
+        self.canvas._edge_version += 1
         self.canvas.queue_draw()
         self.append_log(f"[TRACE] {node.title}: {len(vis_nodes)} nodes, {len(vis_edges)} edges")
 
@@ -638,6 +695,7 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
                 n.ucm_badges.clear()
             for e in self.vm.edges:
                 e.is_ucm_highlighted = False
+            self.canvas._edge_version += 1
             self.canvas.queue_draw()
 
     def _on_mirror_toggled(self, chk: Gtk.CheckButton) -> None:
@@ -649,11 +707,21 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
     def _on_canvas_kcontrol_changed(self, kctl: KcontrolInfo, new_val_str: str) -> None:
         if not self.snap or not self.snap.card:
             return
+        transport = self.transport
         cid = self.snap.card.card_id
-        ok, msg = set_kcontrol_value(self.transport, cid, kctl, new_val_str)
-        self.append_log(f"[{'KCTL' if ok else 'ERR'}] {kctl.name} -> {new_val_str} ({msg})")
-        if ok and self.record_to_ucm:
-            self._record_kctl_to_selected_device(kctl, new_val_str)
+
+        def worker() -> None:
+            ok, msg = set_kcontrol_value(transport, cid, kctl, new_val_str)
+
+            def finish() -> bool:
+                self.append_log(f"[{'KCTL' if ok else 'ERR'}] {kctl.name} -> {new_val_str} ({msg})")
+                if ok and self.record_to_ucm:
+                    self._record_kctl_to_selected_device(kctl, new_val_str)
+                return False
+
+            GLib.idle_add(finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_inspector_kcontrol_set(self, kctl: KcontrolInfo, new_val_str: str) -> None:
         self._on_canvas_kcontrol_changed(kctl, new_val_str)
@@ -742,12 +810,15 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
     def _on_ucm_edited_in_inspector(self) -> None:
         if not self.profile or not self.snap:
             return
+        if self._last_profile_snapshot is not None:
+            self.undo_mgr.push("Edit UCM profile", self._last_profile_snapshot)
         self.profile.is_modified = True
         validate_ucm_profile(self.profile, self.snap, self.vm)
         self._refresh_text_editors_from_profile()
         self.left_panel._rebuild_ucm_panel()
         self.right_inspector._rebuild_ucm_editor()
         self._apply_ucm_overlay_and_redraw(auto_fit=False)
+        self._last_profile_snapshot = copy.deepcopy(self.profile)
 
     # -----------------------------------------------------------------
     # UCM Creation, Device CRUD, Validation, Testing & Export
@@ -757,6 +828,8 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
         if not self.snap or not self.vm:
             return
         self.profile = generate_ucm_profile_from_graph(self.snap, self.vm, ucm_root=self.ucm_root_dir)
+        self.undo_mgr.clear()
+        self._last_profile_snapshot = copy.deepcopy(self.profile)
         self.left_panel.set_data(self.snap, self.vm, self.profile)
         self._rebuild_text_editor_tabs()
         self._apply_ucm_overlay_and_redraw(auto_fit=False)
@@ -814,18 +887,37 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
             for d in diags:
                 self.append_log(f"[{d.severity.upper()}] {d.message}")
 
+    @staticmethod
+    def _confine_local_path(dest_root: str, rel_path: str) -> Optional[str]:
+        root_abs = os.path.abspath(dest_root)
+        full_abs = os.path.abspath(os.path.join(root_abs, rel_path.lstrip("/")))
+        try:
+            if os.path.commonpath([root_abs, full_abs]) != root_abs or full_abs == root_abs:
+                return None
+        except ValueError:
+            return None
+        return full_abs
+
+    @staticmethod
+    def _confine_posix_path(stage_root: str, rel_path: str) -> Optional[str]:
+        norm_rel = posixpath.normpath(rel_path.lstrip("/"))
+        if not norm_rel or norm_rel in (".", "..") or norm_rel.startswith("../") or posixpath.isabs(norm_rel):
+            return None
+        return posixpath.join(stage_root, norm_rel)
+
     def _on_test_alsaucm_clicked(self, _btn: Gtk.Button) -> None:
         if not self.profile or not self.snap or not self.snap.card:
             return
-        sync_profile_raw_files(self.profile)
+        if self.profile.is_generated or self.profile.is_modified:
+            sync_profile_raw_files(self.profile)
         cid = self.snap.card.card_id
         verb = self.left_panel.active_verb or next(iter(self.profile.verbs.keys()), "HiFi")
         devices = sorted(self.left_panel.checked_devices)
 
         # Stage raw_files into a temp UCM2 directory (copying /usr/share/alsa/ucm2/ucm.conf + lib/common if local or remote)
-        cmds = ["set", f"_verb {verb}"]
+        cmds = ["set", "_verb", verb]
         for d in devices:
-            cmds.extend(["set", f"_enadev {d}"])
+            cmds.extend(["set", "_enadev", d])
         cmds.extend(["list", "_devices"])
 
         if not self.transport.is_remote:
@@ -837,29 +929,43 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
                     if os.path.exists(src_sub):
                         os.symlink(src_sub, os.path.join(tmpd, sub))
                 for rel, content in self.profile.raw_files.items():
-                    dest = os.path.join(tmpd, rel.lstrip("/"))
+                    dest = self._confine_local_path(tmpd, rel)
+                    if not dest:
+                        self.append_log(f"[WARN] Skipped out-of-tree UCM2 staging path: {rel}")
+                        continue
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
                     with open(dest, "w", encoding="utf-8") as f:
                         f.write(content)
                 rc, out, err = run_alsaucm_command(self.transport, cid, tmpd, cmds)
                 self.append_log(f"[ALSAUCM rc={rc}] verb={verb} devices={devices}\n{out}\n{err}".strip())
         else:
-            # Remote SSH staging under /tmp/sof-ucm-stage
-            stage = "/tmp/sof-ucm-stage"
-            self.transport.run(
-                f"rm -rf {stage} && mkdir -p {stage} && "
-                f"for f in ucm.conf lib common codecs HDA; do "
-                f"[ -e /usr/share/alsa/ucm2/$f ] && ln -s /usr/share/alsa/ucm2/$f {stage}/$f; done"
-            )
-            for rel, content in self.profile.raw_files.items():
-                self.transport.write_text(posixpath.join(stage, rel.lstrip("/")), content, use_sudo=False)
-            rc, out, err = run_alsaucm_command(self.transport, cid, stage, cmds)
-            self.append_log(f"[SSH ALSAUCM rc={rc}] verb={verb} devices={devices}\n{out}\n{err}".strip())
+            rc_mk, out_mk, err_mk = self.transport.run("mktemp -d /tmp/sof-ucm-stage.XXXXXX")
+            stage = out_mk.strip().splitlines()[-1].strip() if rc_mk == 0 and out_mk.strip() else ""
+            if not stage or not stage.startswith("/tmp/sof-ucm-stage."):
+                self.append_log(f"[ERR] Failed to create remote staging dir: {err_mk.strip()}")
+                return
+            try:
+                q_stage = shlex.quote(stage)
+                self.transport.run(
+                    f"for f in ucm.conf lib common codecs HDA; do "
+                    f"[ -e /usr/share/alsa/ucm2/$f ] && ln -s /usr/share/alsa/ucm2/$f {q_stage}/$f; done"
+                )
+                for rel, content in self.profile.raw_files.items():
+                    remote_dest = self._confine_posix_path(stage, rel)
+                    if not remote_dest:
+                        self.append_log(f"[WARN] Skipped out-of-tree remote staging path: {rel}")
+                        continue
+                    self.transport.write_text(remote_dest, content, use_sudo=False)
+                rc, out, err = run_alsaucm_command(self.transport, cid, stage, cmds)
+                self.append_log(f"[SSH ALSAUCM rc={rc}] verb={verb} devices={devices}\n{out}\n{err}".strip())
+            finally:
+                self.transport.run(f"rm -rf {shlex.quote(stage)}")
 
     def _on_save_export_clicked(self, _btn: Gtk.Button) -> None:
         if not self.profile:
             return
-        sync_profile_raw_files(self.profile)
+        if self.profile.is_generated or self.profile.is_modified:
+            sync_profile_raw_files(self.profile)
         dlg = Gtk.FileDialog()
         dlg.set_title("Select UCM2 Root Directory to Save/Export")
         dlg.select_folder(self, None, self._on_save_folder_chosen)
@@ -874,10 +980,50 @@ class SofUcmMainWindow(Gtk.ApplicationWindow):
         dest_root = folder.get_path()
         if not dest_root:
             return
-        need_sudo = dest_root.startswith("/usr") and os.geteuid() != 0
+        dest_abs = os.path.abspath(dest_root)
+        confined: List[Tuple[str, str, str]] = []
         for rel, content in self.profile.raw_files.items():
-            full_path = os.path.join(dest_root, rel.lstrip("/"))
-            ok, msg = LocalTransport().write_text(full_path, content, use_sudo=need_sudo)
+            full_path = self._confine_local_path(dest_abs, rel)
+            if not full_path:
+                self.append_log(f"[WARN] Skipped out-of-tree UCM2 export path: {rel}")
+                continue
+            confined.append((rel, full_path, content))
+        if not confined:
+            self.append_log("[WARN] No valid UCM2 files within target root to save.")
+            return
+
+        need_sudo = dest_abs.startswith("/usr") and os.geteuid() != 0
+        if need_sudo:
+            with tempfile.TemporaryDirectory(prefix="sof-ucm-export-") as tmpd:
+                for rel, _full_path, content in confined:
+                    staged = self._confine_local_path(tmpd, rel)
+                    if not staged:
+                        continue
+                    os.makedirs(os.path.dirname(staged), exist_ok=True)
+                    with open(staged, "w", encoding="utf-8") as f:
+                        f.write(content)
+                proc = subprocess.run(
+                    [
+                        "pkexec",
+                        "sh",
+                        "-c",
+                        'mkdir -p "$2" && cp -r -- "$1"/. "$2"/',
+                        "sof-ucm-save",
+                        tmpd,
+                        dest_abs,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if proc.returncode == 0:
+                    self.append_log(f"[SAVED] Exported {len(confined)} UCM2 file(s) to {dest_abs}")
+                else:
+                    self.append_log(f"[ERR] Failed (rc={proc.returncode}): {proc.stderr.strip()}")
+            return
+
+        for _rel, full_path, content in confined:
+            ok, msg = LocalTransport().write_text(full_path, content, use_sudo=False)
             self.append_log(f"[{'SAVED' if ok else 'ERR'}] {msg}")
 
     def _on_choose_tplg_clicked(self, _btn: Gtk.Button) -> None:

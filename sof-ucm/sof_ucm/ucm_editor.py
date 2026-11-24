@@ -8,7 +8,7 @@ from typing import Callable, Optional, Tuple
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gdk, Gtk, Pango
+from gi.repository import GLib, Gtk, Pango
 
 
 RE_BRACE = re.compile(r"[\{\}\[\]]")
@@ -36,7 +36,9 @@ def check_ucm_syntax_balance(text: str) -> Tuple[bool, Optional[int], str]:
     pairs = {"{": "}", "[": "]"}
     closing = {"}": "{", "]": "["}
     in_dquote = False
+    in_squote = False
     in_comment = False
+    escaped = False
     line_no = 1
     i = 0
     n = len(text)
@@ -46,20 +48,35 @@ def check_ucm_syntax_balance(text: str) -> Tuple[bool, Optional[int], str]:
             line_no += 1
             in_comment = False
             in_dquote = False
+            in_squote = False
+            escaped = False
             i += 1
             continue
         if in_comment:
             i += 1
             continue
-        if ch == "#" and not in_dquote:
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if (in_dquote or in_squote) and ch == "\\":
+            escaped = True
+            i += 1
+            continue
+        in_str = in_dquote or in_squote
+        if ch == "#" and not in_str:
             in_comment = True
             i += 1
             continue
-        if ch == '"' and (i == 0 or text[i - 1] != "\\"):
+        if ch == '"' and not in_squote:
             in_dquote = not in_dquote
             i += 1
             continue
-        if not in_dquote:
+        if ch == "'" and not in_dquote:
+            in_squote = not in_squote
+            i += 1
+            continue
+        if not in_str:
             if ch in pairs:
                 stack.append((ch, line_no))
             elif ch in closing:
@@ -160,10 +177,11 @@ class UcmTextEditor(Gtk.Box):
     def _rehighlight(self) -> None:
         text = self.get_text()
         ok, _ln, msg = check_ucm_syntax_balance(text)
+        esc_msg = GLib.markup_escape_text(msg)
         if ok:
-            self.status_lbl.set_markup(f"<span foreground='#34d399'>{msg}</span>")
+            self.status_lbl.set_markup(f"<span foreground='#34d399'>{esc_msg}</span>")
         else:
-            self.status_lbl.set_markup(f"<span foreground='#f87171'>{msg}</span>")
+            self.status_lbl.set_markup(f"<span foreground='#f87171'>{esc_msg}</span>")
 
         start = self.buffer.get_start_iter()
         end = self.buffer.get_end_iter()
@@ -188,4 +206,5 @@ class UcmTextEditor(Gtk.Box):
         if self.on_apply_text:
             ok, msg = self.on_apply_text(self.rel_path, self.get_text())
             color = "#34d399" if ok else "#f87171"
-            self.status_lbl.set_markup(f"<span foreground='{color}'>{msg}</span>")
+            esc_msg = GLib.markup_escape_text(msg)
+            self.status_lbl.set_markup(f"<span foreground='{color}'>{esc_msg}</span>")

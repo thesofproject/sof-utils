@@ -2,19 +2,26 @@
 """Unit and headless Cairo rendering tests for sof-ucm graph discovery, layout, and PNG export."""
 
 import os
+import struct
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-from sof_ucm.discovery import LocalTransport, discover_machine_audio, parse_amixer_contents
+from sof_ucm.discovery import (
+    LocalTransport,
+    SshTransport,
+    discover_cards,
+    discover_machine_audio,
+    parse_amixer_contents,
+)
 from sof_ucm.graph_builder import (
     apply_ucm_overlay_to_graph,
     build_end_to_end_graph,
     trace_reachable_from_node,
 )
-from sof_ucm.graph_canvas import UcmCanvasRenderer
+from sof_ucm.graph_canvas import UcmCanvasRenderer, UcmGraphCanvas
 from sof_ucm.layout import layout_end_to_end_graph
 from sof_ucm.model import (
     DapmEdgeInfo,
@@ -24,7 +31,13 @@ from sof_ucm.model import (
     PcmDeviceInfo,
     SoundCardInfo,
 )
-from sof_ucm.tplg_loader import parse_tplg_file
+from sof_ucm.tplg_loader import (
+    SND_SOC_TPLG_MAGIC,
+    SND_SOC_TPLG_TYPE_DAI_LINK,
+    SND_SOC_TPLG_TYPE_PCM,
+    parse_tplg_bytes,
+    parse_tplg_file,
+)
 from sof_ucm.ucm_serializer import generate_ucm_profile_from_graph, validate_ucm_profile
 
 
@@ -135,7 +148,17 @@ class TestGraphAndRender(unittest.TestCase):
 
     def test_local_machine_card_discovery_and_render(self) -> None:
         transport = LocalTransport()
-        snap = discover_machine_audio(transport, 2)
+        cards = discover_cards(transport)
+        if not cards:
+            self.skipTest("No local ALSA sound cards found")
+        snap = None
+        for card in cards:
+            cand = discover_machine_audio(transport, card.card_id)
+            if cand.pcms:
+                snap = cand
+                break
+        if snap is None:
+            self.skipTest("No local ALSA card with PCM devices found")
         vm = build_end_to_end_graph(snap)
         layout_end_to_end_graph(vm)
         self.assertGreater(len(vm.nodes), 0)
@@ -204,6 +227,75 @@ class TestGraphAndRender(unittest.TestCase):
         for ep in eps:
             for port in ep.in_ports + ep.out_ports:
                 self.assertEqual(round(port.rel_x, 2), 0.0)
+
+    def test_tplg_multi_link_and_bounds_safety(self) -> None:
+        def make_hdr(hdr_type: int, payload: bytes, count: int = 1) -> bytes:
+            return struct.pack("<9I", SND_SOC_TPLG_MAGIC, 5, 0, hdr_type, 36, 0, len(payload), 0, count) + payload
+
+        # Build 2 DAI_LINK structs in one block (200 bytes each with 0 priv_size at offset 196)
+        link_elems = []
+        for idx, name in enumerate((b"LinkA", b"LinkB")):
+            buf = bytearray(200)
+            struct.pack_into("<II", buf, 0, 200, idx)
+            buf[8:8 + len(name)] = name
+            buf[52:59] = b"Stream" + bytes([ord("0") + idx])
+            struct.pack_into("<I", buf, 196, 0)
+            link_elems.append(bytes(buf))
+        # Also include a PCM element whose pcm_priv_size deliberately overflows block_end
+        bad_pcm = bytearray(912)
+        bad_pcm[4:9] = b"BadPM"
+        struct.pack_into("<I", bad_pcm, 908, 999999)
+        tplg = parse_tplg_bytes(
+            make_hdr(SND_SOC_TPLG_TYPE_DAI_LINK, b"".join(link_elems), count=2)
+            + make_hdr(SND_SOC_TPLG_TYPE_PCM, bytes(bad_pcm), count=1)
+        )
+        self.assertEqual([lk.name for lk in tplg.links], ["LinkA", "LinkB"])
+        self.assertEqual(tplg.pcms, [])
+
+    def test_ssh_transport_cmd_hardening(self) -> None:
+        cmd = SshTransport("-oProxyCommand=bad")._base_ssh_cmd()
+        self.assertIn("--", cmd)
+        self.assertEqual(cmd[-2:], ["--", "-oProxyCommand=bad"])
+        ctl_opt = next(c for c in cmd if c.startswith("ControlPath="))
+        self.assertFalse(ctl_opt.startswith("ControlPath=/tmp/"))
+        self.assertTrue(ctl_opt.endswith("/ssh-%C"))
+
+    def test_edge_texture_key_distinguishes_equal_length_traces(self) -> None:
+        snap = MachineAudioSnapshot(
+            target_label="trace-key",
+            card=SoundCardInfo(card_id=0, id="c0", driver="sof", name="c0", longname="c0", components=""),
+            pcms=[
+                PcmDeviceInfo(card_id=0, device_id=0, direction="playback", id="P0", name="P0"),
+                PcmDeviceInfo(card_id=0, device_id=1, direction="playback", id="P1", name="P1"),
+            ],
+            dapm_widgets=[
+                DapmWidgetInfo(name="DAC1", component="card", widget_type="dac", power=1),
+                DapmWidgetInfo(name="DAC2", component="card", widget_type="dac", power=0),
+                DapmWidgetInfo(name="Speaker", component="card", widget_type="spk", power=1),
+                DapmWidgetInfo(name="Headphones", component="card", widget_type="hp", power=0),
+            ],
+            dapm_edges=[
+                DapmEdgeInfo(src_name="DAC1", src_comp="card", dst_name="Speaker", dst_comp="card", active=True),
+                DapmEdgeInfo(src_name="DAC2", src_comp="card", dst_name="Headphones", dst_comp="card", active=False),
+            ],
+            dapm_available=True,
+        )
+        vm = build_end_to_end_graph(snap)
+        layout_end_to_end_graph(vm)
+        canvas = UcmGraphCanvas()
+        canvas.set_view_model(vm, auto_fit=False)
+        edge_ids = [e.id for e in vm.edges]
+        self.assertEqual(len(edge_ids), 2)
+        vm.has_active_trace = True
+        vm.highlighted_edge_ids = {edge_ids[0]}
+        vm.highlighted_node_ids = {"dapm:card:DAC1", "dapm:card:Speaker"}
+        canvas._ensure_edge_texture(vm)
+        key1 = canvas._edge_tex_key
+        vm.highlighted_edge_ids = {edge_ids[1]}
+        vm.highlighted_node_ids = {"dapm:card:DAC2", "dapm:card:Headphones"}
+        canvas._ensure_edge_texture(vm)
+        key2 = canvas._edge_tex_key
+        self.assertNotEqual(key1, key2)
 
 
 if __name__ == "__main__":

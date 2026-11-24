@@ -15,6 +15,7 @@ from sof_ucm.model import (
     SoundCardInfo,
     UcmProfile,
     UcmSectionDevice,
+    UcmSectionModifier,
     UcmSequenceCmd,
     UcmVerb,
 )
@@ -23,8 +24,10 @@ from sof_ucm.ucm_parser import load_ucm_profile, parse_ucm_ast, _apply_ucm_items
 from sof_ucm.ucm_serializer import (
     serialize_master_conf,
     serialize_verb_conf,
+    sync_profile_raw_files,
     validate_ucm_profile,
 )
+from sof_ucm.window import SofUcmMainWindow
 
 
 class TestUcmParserAndSerializer(unittest.TestCase):
@@ -137,6 +140,74 @@ class TestUcmParserAndSerializer(unittest.TestCase):
         diags = validate_ucm_profile(profile, snap)
         errs = [d for d in diags if d.severity == "error"]
         self.assertGreaterEqual(len(errs), 2)
+
+    def test_single_quotes_escaping_modifier_conflicts_and_preservation(self) -> None:
+        # Single-quoted strings containing # and [ ] must not trigger false syntax errors
+        ok, _ln, msg = check_ucm_syntax_balance(
+            "SectionVerb {\n\tEnableSequence [\n\t\tcset \"name='HDMI [0] # Switch' on\"\n\t]\n}\n"
+        )
+        self.assertTrue(ok, msg)
+        ok_sq, _ln2, msg2 = check_ucm_syntax_balance(
+            "SectionDevice.'HDMI [0] # Out' {\n\tValue {\n\t\tName 'A [B] # C'\n\t}\n}\n"
+        )
+        self.assertTrue(ok_sq, msg2)
+
+        # Escaping and SectionModifier.ConflictingDevice
+        verb = UcmVerb(
+            name="HiFi",
+            file_path="card/HiFi.conf",
+            devices={
+                "Speaker": UcmSectionDevice(name="Speaker", source_file="card/HiFi.conf"),
+                "HDMI1": UcmSectionDevice(name="HDMI1", source_file="card/Hdmi.conf"),
+            },
+            modifiers={
+                "PlayTone": UcmSectionModifier(
+                    name='Tone "A\\B"',
+                    comment='Test "quoted" \\ mod',
+                    conflicting_devices=["Speaker"],
+                    supported_devices=["Headphones"],
+                    source_file="card/HiFi.conf",
+                )
+            },
+        )
+        vtxt = serialize_verb_conf(verb, ucm_root_dir="/usr/share/alsa/ucm2", target_rel_path="card/HiFi.conf")
+        self.assertIn('ConflictingDevice [', vtxt)
+        self.assertIn('"Speaker"', vtxt)
+        self.assertIn(r'Test \"quoted\" \\ mod', vtxt)
+        # Foreign-sourced SectionDevice (Hdmi.conf) must not be duplicated into HiFi.conf
+        self.assertNotIn('SectionDevice."HDMI1"', vtxt)
+
+        # Conditional / multi-file profiles loaded from disk must not be flattened by sync_profile_raw_files
+        cond_master = (
+            'Syntax 6\n'
+            'SectionUseCase."HiFi" {\n\tFile "card/HiFi.conf"\n}\n'
+            'If.cond {\n\tCondition { Type String Empty "" }\n\tTrue { Include.h.File "card/Hdmi.conf" }\n}\n'
+        )
+        cond_hifi = 'SectionVerb {\n\tValue { TQ "HiFi" }\n}\nInclude.hdmi.File "card/Hdmi.conf"\n'
+        prof = UcmProfile(
+            ucm_root_dir="/usr/share/alsa/ucm2",
+            master_rel_path="card/card.conf",
+            raw_files={"card/card.conf": cond_master, "card/HiFi.conf": cond_hifi},
+            verbs={"HiFi": verb},
+            is_generated=False,
+            is_modified=True,
+        )
+        sync_profile_raw_files(prof)
+        self.assertEqual(prof.raw_files["card/card.conf"], cond_master)
+        self.assertEqual(prof.raw_files["card/HiFi.conf"], cond_hifi)
+
+    def test_path_confinement_rejects_traversal(self) -> None:
+        self.assertIsNone(SofUcmMainWindow._confine_local_path("/tmp/stage", "../../etc/passwd"))
+        self.assertIsNone(SofUcmMainWindow._confine_local_path("/tmp/stage", "."))
+        self.assertEqual(
+            SofUcmMainWindow._confine_local_path("/tmp/stage", "card/HiFi.conf"),
+            "/tmp/stage/card/HiFi.conf",
+        )
+        self.assertIsNone(SofUcmMainWindow._confine_posix_path("/tmp/stage.abc", "../escape.conf"))
+        self.assertEqual(
+            SofUcmMainWindow._confine_posix_path("/tmp/stage.abc", "/card/HiFi.conf"),
+            "/tmp/stage.abc/card/HiFi.conf",
+        )
 
 
 if __name__ == "__main__":
