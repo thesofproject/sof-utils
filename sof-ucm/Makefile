@@ -15,7 +15,8 @@ PY_SRCS  := $(wildcard sof_ucm/*.py)
 all: check
 
 check:
-	$(PYTHON) -B -m py_compile sof-ucm $(PY_SRCS)
+	$(PYTHON) -B -m py_compile sof-ucm $(PY_SRCS) $(wildcard tests/*.py)
+	$(PYTHON) -B -m unittest discover -s tests
 
 install:
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"

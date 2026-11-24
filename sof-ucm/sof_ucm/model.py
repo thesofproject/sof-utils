@@ -322,7 +322,7 @@ class UcmSequenceCmd:
     def format_line(self, indent: str = "\t\t") -> str:
         if self.cmd == "comment":
             return f"{indent}# {self.arg}"
-        q_arg = self.arg.replace('"', '\\"')
+        q_arg = self.arg.replace("\\", "\\\\").replace('"', '\\"')
         c_part = f"  # {self.comment}" if self.comment else ""
         return f'{indent}{self.cmd} "{q_arg}"{c_part}'
 

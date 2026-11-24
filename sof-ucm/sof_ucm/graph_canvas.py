@@ -1311,8 +1311,8 @@ class UcmGraphCanvas(Gtk.Widget):
             id(vm),
             self._edge_version,
             vm.has_active_trace,
-            len(vm.highlighted_edge_ids),
-            len(vm.highlighted_node_ids),
+            frozenset(vm.highlighted_edge_ids),
+            frozenset(vm.highlighted_node_ids),
             sel_node,
             sel_edge,
         )

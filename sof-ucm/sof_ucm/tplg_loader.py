@@ -326,6 +326,8 @@ def _parse_single_control(
         cpriv_sz = struct.unpack_from("<I", data, off + 356)[0]
         scale_min, scale_step, scale_mute = struct.unpack_from("<iII", data, off + 76)
         next_off = off + hdr_sz + cpriv_sz
+        if next_off > block_end:
+            return block_end, None
         kctl = TplgKcontrolDesc(
             name=cname,
             ctl_type=ctype,
@@ -359,6 +361,8 @@ def _parse_single_control(
                 texts.append(t_str)
         cpriv_sz = struct.unpack_from("<I", data, off + 1760)[0]
         next_off = off + hdr_sz + cpriv_sz
+        if next_off > block_end:
+            return block_end, None
         kctl = TplgKcontrolDesc(
             name=cname,
             ctl_type=ctype,
@@ -376,6 +380,8 @@ def _parse_single_control(
             return block_end, None
         cpriv_sz = struct.unpack_from("<I", data, off + 236)[0]
         next_off = off + hdr_sz + cpriv_sz
+        if next_off > block_end:
+            return block_end, None
         kctl = TplgKcontrolDesc(
             name=cname,
             ctl_type=ctype,
@@ -480,7 +486,7 @@ def parse_tplg_bytes(data: bytes, source_path: str = "") -> TplgTopology:
                     proc_domain=proc_dom,
                     uuid_hex=uuid_hex,
                     num_input_pins=word_map.get(SOF_TKN_COMP_NUM_INPUT_PINS, 1) or 1,
-                    num_output_pins=word_map.get(SOF_TPLG_NUM_OUT_FALLBACK := SOF_TKN_COMP_NUM_OUTPUT_PINS, 1) or 1,
+                    num_output_pins=word_map.get(SOF_TKN_COMP_NUM_OUTPUT_PINS, 1) or 1,
                     dai_type=str_map.get(SOF_TKN_DAI_TYPE, ""),
                     dai_index=word_map.get(SOF_TKN_DAI_INDEX, -1),
                 )
@@ -561,7 +567,10 @@ def parse_tplg_bytes(data: bytes, source_path: str = "") -> TplgTopology:
                 pb_sname = _cstr(data[off + 692 + 4:off + 692 + 48])
                 cap_sname = _cstr(data[off + 692 + 104 + 4:off + 692 + 104 + 48])
                 pcm_priv_size = struct.unpack_from("<I", data, off + 908)[0]
-                off += 912 + pcm_priv_size
+                next_off = off + 912 + pcm_priv_size
+                if next_off > block_end:
+                    break
+                off = next_off
                 pdesc = TplgPcmDesc(
                     pcm_id=pcm_id,
                     name=pcm_name,
@@ -579,11 +588,17 @@ def parse_tplg_bytes(data: bytes, source_path: str = "") -> TplgTopology:
                 if off + 200 > block_end:
                     break
                 l_size = struct.unpack_from("<I", data, off)[0]
+                if l_size < 16 or off + l_size > block_end:
+                    break
                 l_name = _cstr(data[off + 8:off + 52]) if l_size >= 52 else ""
                 l_sname = _cstr(data[off + 52:off + 96]) if l_size >= 96 else ""
                 l_id = struct.unpack_from("<I", data, off + 4)[0]
+                priv_sz = struct.unpack_from("<I", data, off + l_size - 4)[0]
+                next_off = off + l_size + priv_sz
+                if next_off > block_end:
+                    break
                 tplg.links.append(TplgLinkDesc(link_id=l_id, name=l_name, stream_name=l_sname))
-                break
+                off = next_off
 
         elif hdr_type in (SND_SOC_TPLG_TYPE_MIXER, SND_SOC_TPLG_TYPE_ENUM, SND_SOC_TPLG_TYPE_BYTES):
             for ki in range(hdr_count):

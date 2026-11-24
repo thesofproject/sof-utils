@@ -136,6 +136,20 @@ class SshTransport(Transport):
     def is_remote(self) -> bool:
         return True
 
+    @staticmethod
+    def _control_path() -> str:
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+        if runtime_dir and os.path.isdir(runtime_dir):
+            ctl_dir = os.path.join(runtime_dir, "sof-ucm")
+        else:
+            ctl_dir = os.path.join(os.path.expanduser("~"), ".cache", "sof-ucm")
+        try:
+            os.makedirs(ctl_dir, mode=0o700, exist_ok=True)
+            os.chmod(ctl_dir, 0o700)
+        except OSError:
+            pass
+        return os.path.join(ctl_dir, "ssh-%C")
+
     def _base_ssh_cmd(self) -> List[str]:
         cmd = [
             "ssh",
@@ -143,14 +157,14 @@ class SshTransport(Transport):
             "-o", "ConnectTimeout=6",
             "-o", "ControlMaster=auto",
             "-o", "ControlPersist=60",
-            "-o", "ControlPath=/tmp/sof-ucm-ssh-%r@%h:%p",
+            "-o", f"ControlPath={self._control_path()}",
         ]
         if self.port != 22:
             cmd.extend(["-p", str(self.port)])
         if self.identity_file:
             cmd.extend(["-i", self.identity_file])
         cmd.extend(self.extra_opts)
-        cmd.append(self.target)
+        cmd.extend(["--", self.target])
         return cmd
 
     def run(self, command: str, timeout: float = 12.0) -> Tuple[int, str, str]:

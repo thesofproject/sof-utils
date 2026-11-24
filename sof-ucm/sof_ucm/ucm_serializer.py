@@ -154,6 +154,31 @@ def validate_ucm_profile(
 # UCM2 Serializer (AST -> Clean Formatted ALSA UCM2 .conf Text)
 # ---------------------------------------------------------------------------
 
+def _ucm_quote(val: object) -> str:
+    s = str(val).replace("\\", "\\\\").replace('"', '\\"').replace("\r\n", " ").replace("\n", " ")
+    return f'"{s}"'
+
+
+def _rel_ucm_path(path: str, ucm_root_dir: str) -> str:
+    if not path:
+        return ""
+    if ucm_root_dir:
+        root = ucm_root_dir.rstrip("/")
+        if root and (path == root or path.startswith(root + "/")):
+            return path[len(root) + 1:].lstrip("/")
+    return path.lstrip("/")
+
+
+def _has_non_flat_ucm_syntax(text: str) -> bool:
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if re.match(r"^(?:If(?:\.|\s|\{|$)|Condition\b|DefineRegex\b|DefineMacro\b|Include\.|Macro\.)", s):
+            return True
+    return False
+
+
 def _fmt_seq_block(name: str, cmds: List[UcmSequenceCmd], indent: str = "\t") -> List[str]:
     if not cmds:
         return []
@@ -167,24 +192,24 @@ def _fmt_seq_block(name: str, cmds: List[UcmSequenceCmd], indent: str = "\t") ->
 def serialize_master_conf(profile: UcmProfile) -> str:
     lines: List[str] = [
         f"# ALSA UCM2 Master Configuration for {profile.card_longname or profile.card_name or 'SOF Card'}",
-        f"# Generated / Edited by sof-ucm",
+        "# Generated / Edited by sof-ucm",
         "",
         f"Syntax {profile.syntax_version}",
         "",
     ]
     if profile.comment:
-        lines.append(f'Comment "{profile.comment}"')
+        lines.append(f"Comment {_ucm_quote(profile.comment)}")
         lines.append("")
 
     if profile.defines:
         lines.append("Define {")
         for k, v in profile.defines.items():
-            lines.append(f'\t{k} "{v}"')
+            lines.append(f"\t{k} {_ucm_quote(v)}")
         lines.append("}")
         lines.append("")
 
     for inc_id, inc_ref in profile.includes:
-        lines.append(f'Include.{inc_id}.File "{inc_ref}"')
+        lines.append(f"Include.{inc_id}.File {_ucm_quote(inc_ref)}")
     if profile.includes:
         lines.append("")
 
@@ -200,17 +225,22 @@ def serialize_master_conf(profile: UcmProfile) -> str:
         vfile = verb.file_path or f"{vname}.conf"
         if profile.ucm_root_dir and vfile.startswith(profile.ucm_root_dir):
             vfile = vfile[len(profile.ucm_root_dir):]
-        lines.append(f'SectionUseCase."{vname}" {{')
-        lines.append(f'\tFile "{vfile}"')
+        lines.append(f"SectionUseCase.{_ucm_quote(vname)} {{")
+        lines.append(f"\tFile {_ucm_quote(vfile)}")
         if verb.comment:
-            lines.append(f'\tComment "{verb.comment}"')
+            lines.append(f"\tComment {_ucm_quote(verb.comment)}")
         lines.append("}")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
 
 
-def serialize_verb_conf(verb: UcmVerb) -> str:
+def serialize_verb_conf(
+    verb: UcmVerb,
+    ucm_root_dir: str = "",
+    target_rel_path: str = "",
+) -> str:
+    target_rel = target_rel_path.lstrip("/")
     lines: List[str] = [
         f"# Use case configuration for verb '{verb.name}'",
         "# Generated / Edited by sof-ucm",
@@ -224,24 +254,29 @@ def serialize_verb_conf(verb: UcmVerb) -> str:
     if verb.values:
         lines.append("\tValue {")
         for k, v in verb.values.items():
-            lines.append(f'\t\t{k} "{v}"' if (" " in str(v) or not str(v).isdigit()) else f"\t\t{k} {v}")
+            sv = str(v)
+            lines.append(f"\t\t{k} {sv}" if sv.isdigit() else f"\t\t{k} {_ucm_quote(sv)}")
         lines.append("\t}")
     lines.append("}")
     lines.append("")
 
     for dname, dev in verb.devices.items():
-        lines.append(f'SectionDevice."{dname}" {{')
+        if target_rel and dev.source_file:
+            dev_rel = _rel_ucm_path(dev.source_file, ucm_root_dir)
+            if dev_rel and dev_rel != target_rel:
+                continue
+        lines.append(f"SectionDevice.{_ucm_quote(dname)} {{")
         if dev.comment:
-            lines.append(f'\tComment "{dev.comment}"')
+            lines.append(f"\tComment {_ucm_quote(dev.comment)}")
         if dev.conflicting_devices:
             lines.append("\tConflictingDevice [")
             for cd in dev.conflicting_devices:
-                lines.append(f'\t\t"{cd}"')
+                lines.append(f"\t\t{_ucm_quote(cd)}")
             lines.append("\t]")
         if dev.supported_devices:
             lines.append("\tSupportedDevice [")
             for sd in dev.supported_devices:
-                lines.append(f'\t\t"{sd}"')
+                lines.append(f"\t\t{_ucm_quote(sd)}")
             lines.append("\t]")
         if dev.enable_seq:
             lines.extend(_fmt_seq_block("EnableSequence", dev.enable_seq, indent="\t"))
@@ -251,22 +286,28 @@ def serialize_verb_conf(verb: UcmVerb) -> str:
             lines.append("\tValue {")
             for k, v in dev.values.items():
                 sv = str(v)
-                if sv.isdigit():
-                    lines.append(f"\t\t{k} {sv}")
-                else:
-                    lines.append(f'\t\t{k} "{sv}"')
+                lines.append(f"\t\t{k} {sv}" if sv.isdigit() else f"\t\t{k} {_ucm_quote(sv)}")
             lines.append("\t}")
         lines.append("}")
         lines.append("")
 
     for mname, mod in verb.modifiers.items():
-        lines.append(f'SectionModifier."{mname}" {{')
+        if target_rel and mod.source_file:
+            mod_rel = _rel_ucm_path(mod.source_file, ucm_root_dir)
+            if mod_rel and mod_rel != target_rel:
+                continue
+        lines.append(f"SectionModifier.{_ucm_quote(mname)} {{")
         if mod.comment:
-            lines.append(f'\tComment "{mod.comment}"')
+            lines.append(f"\tComment {_ucm_quote(mod.comment)}")
+        if mod.conflicting_devices:
+            lines.append("\tConflictingDevice [")
+            for cd in mod.conflicting_devices:
+                lines.append(f"\t\t{_ucm_quote(cd)}")
+            lines.append("\t]")
         if mod.supported_devices:
             lines.append("\tSupportedDevice [")
             for sd in mod.supported_devices:
-                lines.append(f'\t\t"{sd}"')
+                lines.append(f"\t\t{_ucm_quote(sd)}")
             lines.append("\t]")
         if mod.enable_seq:
             lines.extend(_fmt_seq_block("EnableSequence", mod.enable_seq, indent="\t"))
@@ -275,7 +316,8 @@ def serialize_verb_conf(verb: UcmVerb) -> str:
         if mod.values:
             lines.append("\tValue {")
             for k, v in mod.values.items():
-                lines.append(f'\t\t{k} "{v}"')
+                sv = str(v)
+                lines.append(f"\t\t{k} {sv}" if sv.isdigit() else f"\t\t{k} {_ucm_quote(sv)}")
             lines.append("\t}")
         lines.append("}")
         lines.append("")
@@ -284,14 +326,55 @@ def serialize_verb_conf(verb: UcmVerb) -> str:
 
 
 def sync_profile_raw_files(profile: UcmProfile) -> None:
-    """Regenerate raw_files entries from the structured UcmProfile AST."""
+    """Regenerate raw_files entries without overwriting conditional/included UCM2 sources."""
     master_key = profile.master_rel_path or f"{profile.card_driver or 'card'}.conf"
-    profile.raw_files[master_key] = serialize_master_conf(profile)
+    if profile.is_generated or master_key not in profile.raw_files:
+        profile.raw_files[master_key] = serialize_master_conf(profile)
+    elif profile.is_modified:
+        existing_master = profile.raw_files[master_key]
+        if not _has_non_flat_ucm_syntax(existing_master) and not profile.includes:
+            profile.raw_files[master_key] = serialize_master_conf(profile)
+        else:
+            # Preserve existing conditional/Include structure; append any newly added verbs missing from raw text.
+            additions: List[str] = []
+            for vname, verb in profile.verbs.items():
+                if f'"{vname}"' not in existing_master and f"'{vname}'" not in existing_master:
+                    vfile = verb.file_path or f"{vname}.conf"
+                    if profile.ucm_root_dir and vfile.startswith(profile.ucm_root_dir):
+                        vfile = vfile[len(profile.ucm_root_dir):]
+                    block = [f"SectionUseCase.{_ucm_quote(vname)} {{", f"\tFile {_ucm_quote(vfile)}"]
+                    if verb.comment:
+                        block.append(f"\tComment {_ucm_quote(verb.comment)}")
+                    block.append("}")
+                    additions.append("\n".join(block))
+            if additions:
+                profile.raw_files[master_key] = existing_master.rstrip() + "\n\n" + "\n\n".join(additions) + "\n"
+
     for vname, verb in profile.verbs.items():
-        vkey = verb.file_path or f"{vname}.conf"
-        if profile.ucm_root_dir and vkey.startswith(profile.ucm_root_dir):
-            vkey = vkey[len(profile.ucm_root_dir):].lstrip("/")
-        profile.raw_files[vkey] = serialize_verb_conf(verb)
+        vkey = _rel_ucm_path(verb.file_path, profile.ucm_root_dir) if verb.file_path else f"{vname}.conf"
+        if profile.is_generated or vkey not in profile.raw_files:
+            profile.raw_files[vkey] = serialize_verb_conf(
+                verb,
+                ucm_root_dir=profile.ucm_root_dir,
+                target_rel_path=vkey,
+            )
+            continue
+        if not profile.is_modified:
+            continue
+        existing_verb = profile.raw_files[vkey]
+        has_conditional_devs = any(
+            d.is_conditional
+            and (not d.source_file or _rel_ucm_path(d.source_file, profile.ucm_root_dir) == vkey)
+            for d in verb.devices.values()
+        )
+        if _has_non_flat_ucm_syntax(existing_verb) or has_conditional_devs:
+            # Keep raw conditional/include verb text intact rather than stripping If/Condition/Include blocks.
+            continue
+        profile.raw_files[vkey] = serialize_verb_conf(
+            verb,
+            ucm_root_dir=profile.ucm_root_dir,
+            target_rel_path=vkey,
+        )
 
 
 # ---------------------------------------------------------------------------
